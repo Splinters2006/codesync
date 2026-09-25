@@ -4,7 +4,7 @@ use std::{
 };
 
 const HELP: &str = "codesync — sync code and notes over SSH
-  codesync init USER@HOST /absolute/remote/folder  Save settings and set up server
+  codesync init [--force] USER@HOST /absolute/remote/folder
   codesync setup                                Retry server setup
   codesync push [--dry-run]
   codesync pull [--dry-run]
@@ -13,6 +13,19 @@ const HELP: &str = "codesync — sync code and notes over SSH
 Run from your project folder. Sync may overwrite files; preview with --dry-run.";
 
 const SETUP: &str = include_str!("setup.sh");
+// Shared by direct SSH commands and rsync's SSH transport.
+const SSH_OPTIONS: [&str; 6] = [
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPersist=10m",
+    "-o",
+    "ControlPath=~/.ssh/codesync-%C",
+];
+
+fn ssh_transport() -> String {
+    format!("ssh {}", SSH_OPTIONS.join(" "))
+}
 
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -58,6 +71,7 @@ impl Config {
     }
     fn ssh(&self, script: &str, interactive: bool) -> Result<(), String> {
         let mut cmd = Command::new("ssh");
+        cmd.args(SSH_OPTIONS);
         if interactive {
             cmd.arg("-t");
         }
@@ -75,7 +89,8 @@ impl Config {
             self.ssh(&format!("mkdir -p -- {}", quote(&self.dir)), false)?;
         }
         let mut cmd = Command::new("rsync");
-        cmd.args(["-az", "--protect-args", "--itemize-changes", "-e", "ssh"]);
+        cmd.args(["-az", "--protect-args", "--itemize-changes", "-e"])
+            .arg(ssh_transport());
         for pattern in [
             ".git",
             "target",
@@ -121,20 +136,34 @@ fn run() -> Result<(), String> {
     match action {
         "help" | "--help" | "-h" => println!("{HELP}"),
         "init" => {
-            if args.len() != 3 {
-                return Err("Usage: codesync init USER@HOST /absolute/remote/folder".into());
-            }
+            let (force, host, dir) = match &args[1..] {
+                [host, dir] => (false, host, dir),
+                [flag, host, dir] if flag == "--force" => (true, host, dir),
+                _ => {
+                    return Err(
+                        "Usage: codesync init [--force] USER@HOST /absolute/remote/folder".into(),
+                    );
+                }
+            };
             let config = Config {
-                host: args[1].clone(),
-                dir: args[2].clone(),
+                host: host.clone(),
+                dir: dir.clone(),
             };
             config.validate()?;
             use std::io::Write;
             let mut file = fs::OpenOptions::new()
                 .write(true)
-                .create_new(true)
+                .create_new(!force)
+                .create(force)
+                .truncate(force)
                 .open(".codesync")
-                .map_err(|e| format!("Cannot create .codesync: {e}"))?;
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        "This folder is already configured. Use codesync init --force USER@HOST /remote/folder to change its destination, or codesync setup to retry setup.".into()
+                    } else {
+                        format!("Cannot write .codesync: {e}")
+                    }
+                })?;
             writeln!(file, "{}\n{}", config.host, config.dir).map_err(|e| e.to_string())?;
             println!("Configured {}:{}", config.host, config.dir);
             config.setup()?;
