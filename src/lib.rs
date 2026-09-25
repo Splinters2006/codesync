@@ -1,14 +1,16 @@
 use std::{env, fs, process::Command};
+mod update;
 
 const HELP: &str = "codesync — sync code and notes over SSH
   codesync init [--force] USER@HOST /absolute/remote/folder
   codesync gui                                  Open the desktop app
+  codesync update [--repo /path/to/codesync]      Pull and reinstall from Git
   codesync setup                                Retry server setup
   codesync push [--dry-run]
   codesync pull [--dry-run]
   codesync run COMMAND [ARGS...]
   codesync shell
-Run from your project folder. Sync may overwrite files; preview with --dry-run.";
+Run sync commands from your project folder. Sync may overwrite files; preview with --dry-run.";
 
 pub const EXCLUDES: [&str; 8] = [
     ".git",
@@ -180,6 +182,7 @@ pub fn run_cli(args: Vec<String>) -> Result<(), String> {
     };
     match action {
         "help" | "--help" | "-h" => println!("{HELP}"),
+        "update" => update::run(&args[1..])?,
         "gui" => {
             if args.len() != 1 {
                 return Err("Usage: codesync gui".into());

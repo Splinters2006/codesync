@@ -39,6 +39,32 @@ For an existing installation made with Cargo, repair PATH without rebuilding:
 ```
 
 
+## Update from Git
+
+After installing a version with the updater, run this from any directory:
+
+```sh
+codesync update
+```
+
+Codesync remembers the source checkout used to build it, runs
+`git pull --ff-only --no-rebase`, and reruns the installer. It preserves the
+installation directory and whether you installed the GUI or CLI-only build.
+Close and reopen the GUI afterward.
+
+If you moved the checkout or installed from a Git source cache, point to your clone:
+
+```sh
+codesync update --repo /path/to/codesync
+```
+
+The checkout must be clean and on a branch with a configured upstream. Updates
+stop for local changes, untracked files, detached commits, or divergent branches;
+they do not reset, stash, or discard your work. Git, Cargo, and the normal build
+dependencies are required. If installation fails after pulling, fix the reported
+error and rerun the command. Older versions without `update` need `./install.sh`
+once to gain the command.
+
 ## Add servers and folders
 
 1. Click **Add server**. Enter a name, IP address or hostname, SSH username, and
