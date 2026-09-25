@@ -34,6 +34,24 @@ to confirm their GUI server identity once after this update. The CLI retains its
 normal SSH known-hosts behavior. Removing and re-adding a server creates a new
 identity; ordinary address edits preserve the existing identity.
 
+## Automatic Tailscale preference
+
+Automatic mode prefers a verified Tailscale address. When Tailscale is running,
+Codesync can find a unique peer using the configured hostname, MagicDNS name, or
+Tailscale IP. It does not use the editable server display name to guess identity.
+
+For a saved LAN IP, Codesync first verifies that SSH connection, queries the
+remote device's Tailscale status and SSH listening port, and checks that the
+address belongs to a peer visible to the local Tailscale client. It then verifies
+the same SSH identity over Tailscale before using or saving that address. Future
+connections try it first. The initial LAN/public connection must be reachable
+when no Tailscale address or matching hostname is known yet.
+
+Local only skips discovery and continues to use the primary address. Automatic
+and Remote only retain their configured fallback rules when Tailscale cannot
+connect. First-time identity confirmation is still required; membership in a
+Tailscale network does not automatically trust an SSH host key.
+
 ## Set up Tailscale from Codesync
 
 1. Start while the server is reachable through an existing address, such as its

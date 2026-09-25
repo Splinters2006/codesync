@@ -1,4 +1,5 @@
 mod auth;
+mod browser;
 mod discovery;
 mod jobs;
 mod store;
@@ -47,6 +48,7 @@ struct LinkEditor {
     error: Option<String>,
 }
 struct FolderEditor {
+    viewer: browser::Browser,
     id: u64,
     name: String,
     path: String,
@@ -325,7 +327,7 @@ impl App {
     }
     fn poll(&mut self) {
         let mut finished = None;
-        let mut tailscale_ready = None;
+        let mut tailscale_ready = Vec::new();
         if let Some(job) = &self.job {
             for event in job.events.try_iter().take(64) {
                 match event {
@@ -343,19 +345,25 @@ impl App {
                         self.logins.push((label, url));
                     }
                     jobs::Event::TailscaleReady { server, host, port } => {
-                        tailscale_ready = Some((server, host, port))
+                        tailscale_ready.push((server, host, port))
                     }
                     jobs::Event::Finished(result) => finished = Some(result),
                 }
             }
         }
-        if let Some((id, host, port)) = tailscale_ready
-            && let Some(server) = self.data.servers.iter_mut().find(|s| s.id == id)
-        {
-            server.network.tailscale_host = host;
-            server.network.tailscale_port = port;
+        let mut changed = false;
+        for (id, host, port) in tailscale_ready {
+            if let Some(server) = self.data.servers.iter_mut().find(|server| server.id == id)
+                && (server.network.tailscale_host != host || server.network.tailscale_port != port)
+            {
+                server.network.tailscale_host = host;
+                server.network.tailscale_port = port;
+                changed = true;
+            }
+        }
+        if changed {
             self.persist();
-            self.output.append(b"Tailscale address saved after identity verification. Automatic or Remote only mode can now use it.\n");
+            self.output.append(b"Verified Tailscale connection saved. Automatic mode prefers it for future syncs.\n");
         }
         if let Some(result) = finished {
             self.logins.clear();
@@ -634,6 +642,7 @@ impl App {
             && let Some(folder) = self.data.folders.iter().find(|folder| folder.id == id)
         {
             self.folder_editor = Some(FolderEditor {
+                viewer: browser::Browser::new(folder.path.clone(), ctx),
                 id,
                 name: folder.name.clone(),
                 path: folder.path.display().to_string(),
@@ -773,10 +782,11 @@ impl App {
         if let Some(mut editor) = self.folder_editor.take() {
             let mut open = true;
             let mut save = false;
-            egui::Window::new("Folder settings")
+            egui::Window::new("Folder settings and files")
                 .open(&mut open)
                 .collapsible(false)
-                .default_width(500.0)
+                .default_width(650.0)
+                .max_height(760.0)
                 .vscroll(true)
                 .show(ctx, |ui| {
                     ui.add_enabled_ui(self.job.is_none() && self.link_editor.is_none(), |ui| {
@@ -797,6 +807,7 @@ impl App {
                         if ui.button("Save").clicked() {
                             save = true;
                         }
+                        editor.viewer.show(ui, ctx);
                         self.show_link_settings(ui, Selection::Folder(editor.id));
                     });
                 });

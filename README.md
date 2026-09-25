@@ -79,7 +79,11 @@ once to gain the command.
    are preserved. First-time connections ask you to verify the server fingerprint.
 
 Use **Open** beside a folder or server to open its settings popup.
-Folder settings include its name, local directory, and links. Server settings
+Folder settings include its name, local directory, links, and a file viewer.
+Select a subfolder to browse it or a text file for a read-only preview. The viewer
+has **Up**, **Refresh files**, file sizes, and **Show hidden files** controls. It
+browses the saved local directory, lists folders first, and limits text previews
+to 256 KiB. Binary files and symbolic links are listed but not opened. Server settings
 include addresses, credentials, connection tests, setup, and links. Incoming SSH controls are in the **Hosts** column on Home. For a custom destination, choose **Add link** in
 folder or server settings and enter an absolute remote directory.
 Home includes **Remove** buttons for folders and servers. They remove the entry
@@ -160,7 +164,13 @@ may not appear. You can still add those hosts manually.
 
 Server settings include separate local / primary and public addresses and ports.
 Choose **Automatic**, **Local only**, or **Remote only**. Automatic tries Tailscale,
-local, then public, checking each against the server's saved SSH identity. An
+local, then public, checking each against the server's saved SSH identity. When
+Tailscale is already running, Codesync detects uniquely matching peer names and
+addresses. For a device configured by LAN IP, it learns the Tailscale address
+through the verified SSH connection, verifies SSH over Tailscale, then saves and
+prefers it automatically. No manual Tailscale setup is needed if both devices
+are already connected. Ambiguous names are not guessed, and Local only remains
+local. If Tailscale SSH cannot connect, a verified local/public route can be used. An
 unrelated machine at the same private IP is rejected before files are transferred.
 Use **Test connection** to confirm the server fingerprint once before the first sync.
 

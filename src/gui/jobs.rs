@@ -1,6 +1,6 @@
 use super::{
     auth::{Bridge, Credentials},
-    store::Server,
+    store::{ConnectionMode, Server},
 };
 use std::{
     io::{Read, Write},
@@ -756,8 +756,56 @@ fn identity_known(server: &Server) -> Result<bool, String> {
         _ => Err("Cannot read the saved SSH server identities.".into()),
     }
 }
+fn peer_address(json: &str, configured: &str) -> Option<String> {
+    let status: serde_json::Value = serde_json::from_str(json).ok()?;
+    if status["BackendState"].as_str() != Some("Running") {
+        return None;
+    }
+    let configured = configured
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let mut matches = Vec::new();
+    for peer in status["Peer"].as_object()?.values() {
+        let Some(peer_ips) = peer["TailscaleIPs"].as_array() else {
+            continue;
+        };
+        let ips: Vec<_> = peer_ips
+            .iter()
+            .filter_map(|ip| ip.as_str())
+            .filter_map(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .collect();
+        let dns = peer["DNSName"]
+            .as_str()
+            .unwrap_or("")
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let hostname = peer["HostName"].as_str().unwrap_or("").to_ascii_lowercase();
+        let configured_ip = configured.parse::<std::net::IpAddr>().ok();
+        let address_match = configured_ip.is_some_and(|ip| ips.contains(&ip));
+        let name_match = configured_ip.is_none()
+            && !configured.is_empty()
+            && (configured == dns
+                || configured == hostname
+                || dns.split('.').next() == Some(configured.as_str()));
+        if (address_match || name_match)
+            && let Some(ip) = ips.iter().find(|ip| ip.is_ipv4()).or(ips.first())
+        {
+            matches.push(ip.to_string());
+        }
+    }
+    // Hostnames may be duplicated: never guess which peer the user intended.
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+fn tailscale_membership(json: &str, address: &str) -> bool {
+    peer_address(json, address).is_some()
+}
 fn resolve_endpoint(
-    task: Task,
+    mut task: Task,
     bridge: &mut Bridge,
     cancelled: &AtomicBool,
     events: &Sender<Event>,
@@ -766,6 +814,38 @@ fn resolve_endpoint(
     let known = identity_known(&task.server)?;
     if !known && matches!(task.action, Action::Sync) {
         return Err("Confirm this server's identity first: select the server and use Test connection. Check its fingerprint against the intended server.".into());
+    }
+    let local_tailnet =
+        if task.server.network.mode != ConnectionMode::LocalOnly && available("tailscale") {
+            let mut command = Command::new("tailscale");
+            command.args(["status", "--json"]);
+            Runner {
+                task: &task,
+                bridge,
+                cancelled,
+                events,
+                ctx,
+            }
+            .execute_output(command, None, OutputMode::Capture)
+            .ok()
+            .filter(|status| tailscale_running(status))
+        } else {
+            None
+        };
+    if task.server.network.tailscale_host.is_empty()
+        && let Some(status) = &local_tailnet
+        && let Some(address) = peer_address(status, &task.server.host)
+    {
+        if task
+            .server
+            .host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok()
+        {
+            task.server.network.tailscale_port = task.server.port;
+        }
+        task.server.network.tailscale_host = address;
     }
     let endpoints = task.server.endpoints();
     if endpoints.is_empty() {
@@ -812,6 +892,72 @@ fn resolve_endpoint(
         if result.is_ok() {
             if !identity_known(&candidate.server)? {
                 return Err("The server's SSH identity was not saved. Check ~/.ssh permissions and retry Test connection.".into());
+            }
+            if label == "Tailscale" {
+                let _ = events.send(Event::TailscaleReady {
+                    server: candidate.server.id,
+                    host: candidate.server.host.clone(),
+                    port: candidate.server.port,
+                });
+            } else if let Some(status) = &local_tailnet {
+                // A LAN IP is not a peer identity. Ask the already-verified device
+                // for its Tailscale address instead of guessing from its label.
+                let mut runner = Runner {
+                    task: &candidate,
+                    bridge,
+                    cancelled,
+                    events,
+                    ctx,
+                };
+                let remote_status = runner
+                    .execute_output(
+                        ssh(&candidate.server, "tailscale status --json"),
+                        None,
+                        OutputMode::Capture,
+                    )
+                    .ok();
+                if let Some(host) = remote_status
+                    .as_deref()
+                    .and_then(|json| tailscale_address(json).ok())
+                    .filter(|host| tailscale_membership(status, host))
+                {
+                    let port = runner
+                        .execute_output(
+                            ssh(&candidate.server, "printf '%s' \"${SSH_CONNECTION##* }\""),
+                            None,
+                            OutputMode::Capture,
+                        )
+                        .ok()
+                        .and_then(|text| text.trim().parse::<u16>().ok())
+                        .filter(|port| *port != 0);
+                    if let Some(port) = port {
+                        let mut preferred = candidate.clone();
+                        preferred.server.host = host.clone();
+                        preferred.server.port = port;
+                        if runner
+                            .execute_output(
+                                ssh(&preferred.server, "true"),
+                                None,
+                                OutputMode::Capture,
+                            )
+                            .is_ok()
+                        {
+                            let _ = events.send(Event::TailscaleReady {
+                                server: preferred.server.id,
+                                host,
+                                port,
+                            });
+                            let _ = events.send(Event::Output(
+                                b"Using Tailscale; server identity verified.\n".to_vec(),
+                            ));
+                            return Ok(preferred);
+                        }
+                        let _ = events.send(Event::Output(b"Tailscale SSH is unavailable or its identity did not match; keeping the verified fallback connection.\n".to_vec()));
+                    }
+                }
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("Stopped.".into());
             }
             let _ = events.send(Event::Output(
                 format!("Using {label}; server identity verified.\n").into_bytes(),
@@ -1096,6 +1242,27 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tailscale_matching_uses_peer_addresses_and_unique_names_not_lan_guesses() {
+        let status = r#"{"BackendState":"Running","Peer":{"a":{"HostName":"workstation","DNSName":"workstation.example.ts.net.","TailscaleIPs":["fd7a:115c:a1e0::1","100.100.1.2"]}}}"#;
+        for configured in [
+            "workstation",
+            "WORKSTATION.EXAMPLE.TS.NET.",
+            "100.100.1.2",
+            "[fd7a:115c:a1e0::1]",
+        ] {
+            assert_eq!(
+                peer_address(status, configured).as_deref(),
+                Some("100.100.1.2")
+            );
+        }
+        assert!(peer_address(status, "192.168.1.2").is_none());
+        assert!(peer_address(&status.replace("Running", "Stopped"), "workstation").is_none());
+        let duplicate = r#"{"BackendState":"Running","Peer":{"a":{"HostName":"same","TailscaleIPs":["100.100.1.2"]},"b":{"HostName":"same","TailscaleIPs":["100.100.1.3"]}}}"#;
+        assert!(peer_address(duplicate, "same").is_none());
+        assert!(!tailscale_membership(status, "100.100.9.9"));
+    }
+
     #[test]
     fn passwordless_stop_policy_is_limited_to_one_helper_without_arguments() {
         let policy = stop_ssh_policy(1000);
