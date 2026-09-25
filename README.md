@@ -1,0 +1,178 @@
+# Codesync
+
+Sync code and notes between local folders and your own servers. Includes a Rust
+CLI and a native Linux desktop app with a classic white-and-gray interface.
+
+## Install
+
+The host needs Rust/Cargo, OpenSSH, rsync, and `sha256sum`. The desktop app needs a Wayland or
+X11 desktop with OpenGL. Zenity is optional for the folder picker; you can also
+enter a path manually. Native Windows support is not implemented.
+
+From this repository:
+
+```sh
+cargo install --path . --force
+codesync gui
+```
+
+You can also launch `codesync-gui` directly. If the shell cannot find it, run
+`export PATH="$HOME/.cargo/bin:$PATH"` and add that line to `~/.bashrc` once.
+For a CLI-only installation:
+
+```sh
+cargo install --path . --force --no-default-features --bin codesync
+```
+
+## Add servers and folders
+
+1. Click **Add server**. Enter a name, IP address or hostname, SSH username, and
+   port. Enter your SSH login password, or leave it blank to use SSH keys / agent.
+2. Keep **Use the login password for sudo too** checked if both passwords are the
+   same. Otherwise enter the separate sudo password. Choose **Save & set up** to
+   install rsync if needed, or **Save** if the server is already prepared.
+3. Click **Add folder** and choose an existing local directory.
+4. On **Home**, check folders on the left and servers on the right, then click
+   **Sync**. Each selected folder is synchronized in both directions across all
+   selected servers. New links use `~/codesync/<folder name>`; existing destinations
+   are preserved. First-time connections ask you to verify the server fingerprint.
+
+Use **Open** beside a folder or server to manage its links and settings. For a
+custom destination, choose **Add link** and enter an absolute remote directory.
+Return using **Home** in the toolbar. Use **Connections** to connect another Linux
+host or prepare this host to receive SSH connections. A central server is optional;
+both hosts must be online and reachable. Preparation installs OpenSSH server, rsync,
+and SHA-256 tools and enables SSH at startup. It preserves SSH configuration and
+firewall rules. SSH grants the connected account its normal filesystem permissions.
+
+A server can have many folders, and a folder can have many servers. Each link has
+its own remote directory. For example:
+
+| Local folder | Server | Remote directory |
+| --- | --- | --- |
+| `~/classwork` | Home | `/home/user/classwork` |
+| `~/classwork` | Lab | `/home/user/classwork` |
+| `~/classwork` | Backup | `/home/user/backups/classwork` |
+| `~/notes` | Home | `/home/user/notes` |
+| `~/projects` | Home | `/home/user/projects` |
+
+Select a server in the sidebar to check several folder links, or select a folder
+to check several server links. Use **Select all** or **Clear selection**, then
+**Sync**. Clicking a folder or server name in the table also toggles its checkbox.
+
+Sync compares SHA-256 hashes for files at the same relative path. Equal content
+stays unchanged. Missing files are copied to all selected participants. Different
+versions become prefixed files, such as `Workstation_file1.txt` and
+`HomeServer_file1.txt`, on every participant. The local prefix comes from the
+host's hostname; remote prefixes use their Codesync display names. Identical
+versions shared by several hosts produce one copy. If a prefixed name already
+exists, a hash fragment and counter distinguish it without replacing that file.
+
+All selected copies of one local folder are compared together. Batches stop on
+failure; completed copies and conflict renames remain in place. Deletions are
+never propagated, and missing files can be restored from another participant.
+See [two-way sync](docs/sync.md) for behavior and limitations.
+
+Use the CLI's `codesync run` to run commands or `codesync shell` for interactive
+programs. **Stop** cancels local work but
+cannot undo transferred files or guarantee that a remote process stops.
+
+Leave a link's **Remote directory** empty to default to `~/codesync` on the server.
+The directory is created on the first sync. Use distinct destinations for different
+local folders on the same server.
+
+Edit a server to update its address or credentials. Edit a link to change its
+remote directory. Removing a server, folder, or link does not delete any files;
+removing a server or folder also removes its links from the app.
+
+## Local, public, and Tailscale connections
+
+Server properties includes separate local / primary and public addresses and ports.
+Choose **Automatic**, **Local only**, or **Remote only**. Automatic tries Tailscale,
+local, then public, checking each against the server's saved SSH identity. An
+unrelated machine at the same private IP is rejected before files are transferred.
+Use **Test connection** to confirm the server fingerprint once before the first sync.
+
+**Set up Tailscale** installs and connects Tailscale on your host and the selected
+server. It asks for the host sudo password in a dedicated dialog when needed, and uses
+saved server sudo credentials remotely. Devices already connected skip installation. Sign-in buttons appear in the app when browser login is needed. Setup
+saves the Tailscale address only after verifying SSH over it. Initial SSH access
+must already work. See [remote access setup](docs/remote-access.md) for requirements.
+
+## Passwords and setup
+
+Passwords are remembered **only while the app is open**, and never written to the
+profile file. After restarting, use **Edit server / passwords** to enter them again,
+or use an SSH key and agent. SSH and sudo are separate credentials: the login
+password connects to the server; the sudo password is used only for server setup.
+Regular file transfers run as the SSH user and need writable remote directories.
+
+There is no generic terminal reply field. OpenSSH gets the login password through
+a private local authentication socket. The fixed setup command receives the sudo
+password through its SSH input stream. Passwords are not passed in command-line
+arguments or environment variables. A new host key requires a dedicated fingerprint
+confirmation; changed keys are not automatically trusted. SSH keys requiring a
+passphrase should be unlocked in your SSH agent. OTP / interactive MFA is not
+supported by this GUI version.
+
+SSH access must already work. Rsync setup supports Alpine, Debian/Ubuntu, Fedora, and
+Arch, using root or sudo. Passwordless doas is also supported by the GUI; passworded
+doas needs manual setup through a terminal. Install project tools such as Rust
+separately. The GUI does not need util-linux `script` anymore.
+
+## Saved settings and existing projects
+
+Servers, folders, and links are stored in
+`$XDG_CONFIG_HOME/codesync/profiles.json` (normally
+`~/.config/codesync/profiles.json`). Credentials are kept separately in memory.
+
+The previous `folders.json` list is imported and saved when there is no new profile file.
+Adding a folder with a `.codesync` file imports its existing server destination.
+The GUI does not rewrite `.codesync` when switching servers. The CLI retains its
+original single-destination-per-folder behavior, independently of GUI links.
+
+## Command line
+
+From a local project folder:
+
+```sh
+codesync init user@192.168.0.6 /home/user/classwork
+codesync push --dry-run
+codesync push
+codesync run cargo test
+codesync shell
+codesync pull --dry-run
+codesync pull
+```
+
+`init` saves settings and sets up rsync. Retry setup with `codesync setup`.
+Use `codesync init --force USER@HOST /remote/folder` to replace an existing config.
+See [directories](docs/directories.md) and [SSH logins](docs/authentication.md).
+SSH config aliases can supply keys and jump hosts. The GUI's port field sets the
+port explicitly; the CLI uses the port from your SSH config.
+
+## Sync behavior
+
+The GUI uses manual, two-way hash-based sync. The CLI's `push` and `pull` remain
+explicit one-way rsync operations that can overwrite edits and compare size and
+modification time by default. Keep Git history or backups.
+
+Excluded at any depth: `.git`, `target`, `node_modules`, `.codesync`, `.env`,
+`.env.*`, `*.pem`, `*.key`. GUI two-way sync accepts regular files and directories;
+symbolic links and special files stop the operation before conflict renaming.
+CLI transfers still support symlinks. Dry runs are CLI-only.
+
+For access from class or another network, use a reachable public IPv4/IPv6 address,
+a hostname, or a private VPN address. See [remote access setup](docs/remote-access.md)
+for Tailscale and public-address options. Turning the server on alone does not
+provide access from outside your home network.
+
+## Development
+
+```sh
+cargo run --bin codesync-gui
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+Authentication tests use local Unix sockets; restricted sandboxes must allow those.
