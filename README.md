@@ -15,9 +15,11 @@ From this repository:
 ./install.sh
 ```
 
-The installer runs Cargo and adds its installation directory to PATH for Bash,
-Zsh, or Fish. Open a new terminal, then run `codesync gui` from any directory.
-It also prints a direct command to launch immediately in the current terminal.
+On every machine, the installer runs Cargo and configures PATH for that user
+in Bash, Zsh, or Fish. If an existing `~/.local/bin` or `~/bin` is already on PATH,
+it adds launchers there so the command works immediately. Otherwise, open a new
+terminal after installation and run `codesync gui` from any directory. The
+installer also prints a direct launch command for the current terminal.
 Reinstalling does not duplicate PATH entries. No root privileges are needed.
 `CARGO_INSTALL_ROOT` and `CARGO_HOME` are respected.
 
@@ -29,6 +31,13 @@ For a CLI-only installation:
 
 You can still run `cargo install --path . --force` directly, but Cargo itself does
 not update shell startup files. Use the installer for automatic PATH setup.
+
+For an existing installation made with Cargo, repair PATH without rebuilding:
+
+```sh
+./install.sh --path-only
+```
+
 
 ## Add servers and folders
 

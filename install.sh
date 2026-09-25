@@ -3,13 +3,15 @@
 set -eu
 
 cli_only=false
+path_only=false
 case "${1-}" in
     '') ;;
     --cli-only) cli_only=true; shift ;;
-    *) echo 'Usage: ./install.sh [--cli-only]' >&2; exit 2 ;;
+    --path-only) path_only=true; shift ;;
+    *) echo 'Usage: ./install.sh [--cli-only | --path-only]' >&2; exit 2 ;;
 esac
 if [ "$#" -ne 0 ]; then
-    echo 'Usage: ./install.sh [--cli-only]' >&2
+    echo 'Usage: ./install.sh [--cli-only | --path-only]' >&2
     exit 2
 fi
 
@@ -19,6 +21,12 @@ case "$install_root" in
     /*) ;;
     *) install_root="$(pwd)/$install_root" ;;
 esac
+if [ "$path_only" = true ]; then
+    if [ ! -x "$install_root/bin/codesync" ]; then
+        echo 'Codesync is not installed in the selected Cargo root. Run ./install.sh first.' >&2
+        exit 1
+    fi
+else
 cargo_bin=$(command -v cargo || true)
 if [ -z "$cargo_bin" ] && [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]; then
     cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin/cargo"
@@ -31,6 +39,8 @@ if [ "$cli_only" = true ]; then
     "$cargo_bin" install --path "$project_dir" --root "$install_root" --force --no-default-features --bin codesync
 else
     "$cargo_bin" install --path "$project_dir" --root "$install_root" --force
+fi
+
 fi
 
 # Quote literal paths, including spaces, apostrophes, and shell metacharacters.
@@ -77,10 +87,37 @@ case "${login_shell##*/}" in
         fi
         ;;
 esac
-printf '\nCodesync installed. PATH is configured for new terminals.\n'
+# Reuse a user-owned bin directory already present in the calling shell's PATH.
+# This makes the command visible immediately, without trying to modify the parent shell.
+available_now=false
+case ":$PATH:" in *:"$bin_dir":*) available_now=true ;; esac
+for user_bin in "$HOME/.local/bin" "$HOME/bin"; do
+    [ "$available_now" = false ] || break
+    case ":$PATH:" in *:"$user_bin":*) ;; *) continue ;; esac
+    [ -d "$user_bin" ] && [ -w "$user_bin" ] || continue
+    for binary in codesync codesync-gui; do
+        [ -x "$bin_dir/$binary" ] || continue
+        if [ ! -e "$user_bin/$binary" ] && [ ! -L "$user_bin/$binary" ]; then
+            ln -s -- "$bin_dir/$binary" "$user_bin/$binary"
+        fi
+    done
+    if [ "$user_bin/codesync" -ef "$bin_dir/codesync" ]; then
+        available_now=true
+    fi
+done
+printf '\nCodesync PATH setup completed.\n'
+if [ "$available_now" = true ]; then
+    printf 'codesync is available on the PATH passed to this installer.\n'
+else
+    printf 'Open a new terminal, or run this once in the current terminal:\n'
+    case "${login_shell##*/}" in
+        fish) printf '  %s\n' "$fish_line" ;;
+        *) printf '  export PATH=%s:"$PATH"\n' "$quoted_bin" ;;
+    esac
+fi
 if [ "$cli_only" = true ]; then
     printf 'CLI-only installation: run codesync from your project directory.\n'
 else
-    printf 'Open a new terminal and run: codesync gui\n'
-    printf 'To open the GUI in this terminal now: %s/codesync gui\n' "$quoted_bin"
+    printf 'Launch: codesync gui\n'
+    printf 'Direct launch (works without PATH): %s/codesync gui\n' "$quoted_bin"
 fi

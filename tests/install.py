@@ -51,10 +51,47 @@ chmod +x "$destination/bin/codesync"
             assert text.count('# Codesync PATH') == 1
             assert "\\'" in text
         assert not (home / 'PWNED').exists()
+    # Fresh home: a newly opened interactive shell finds the installed binary
+    # without inheriting Cargo's bin directory or manually sourcing a file.
+    fresh = root / 'fresh'
+    fresh.mkdir()
+    fresh_env = dict(os.environ, HOME=str(fresh), SHELL='/bin/bash',
+                     CARGO_HOME=str(fresh / 'cargo'),
+                     CARGO_INSTALL_ROOT=str(fresh / 'cargo'),
+                     PATH=f'{fakebin}:/usr/bin:/bin')
+    subprocess.run(['sh', str(installer)], env=fresh_env, check=True, capture_output=True)
+    result = subprocess.run(['/bin/bash', '--noprofile', '-ic', 'command -v codesync'],
+                            env=dict(fresh_env, PATH='/usr/bin:/bin'), cwd='/tmp',
+                            check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == str(fresh / 'cargo/bin/codesync')
+
+    # Repair an existing Cargo installation without invoking Cargo again.
+    (fresh / '.bashrc').unlink()
+    subprocess.run(['sh', str(installer), '--path-only'],
+                   env=dict(fresh_env, FAIL_INSTALL='yes'), check=True, capture_output=True)
+    assert (fresh / '.bashrc').exists()
+
+    # Reuse an existing user bin directory: visible even to the original PATH.
+    user_bin = fresh / '.local/bin'
+    user_bin.mkdir(parents=True)
+    linked_env = dict(fresh_env, PATH=f'{user_bin}:{fakebin}:/usr/bin:/bin')
+    subprocess.run(['sh', str(installer), '--path-only'], env=linked_env,
+                   check=True, capture_output=True)
+    assert (user_bin / 'codesync').is_symlink()
+    result = subprocess.run(['/bin/sh', '-c', 'command -v codesync'], env=linked_env,
+                            cwd='/tmp', check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == str(user_bin / 'codesync')
+    # Never replace someone else's command with our launcher.
+    (user_bin / 'codesync').unlink()
+    (user_bin / 'codesync').write_text('unrelated command')
+    subprocess.run(['sh', str(installer), '--path-only'], env=linked_env,
+                   check=True, capture_output=True)
+    assert (user_bin / 'codesync').read_text() == 'unrelated command'
+
     failed = root / 'failed'
     failed.mkdir()
     env.update(HOME=str(failed), SHELL='/bin/bash', FAIL_INSTALL='yes')
     result = subprocess.run(['sh', str(installer)], env=env, capture_output=True)
     assert result.returncode != 0
     assert list(failed.iterdir()) == []
-print('Installer checks passed: persistent PATH, idempotence, quoting, shell configs, and failed-install behavior.')
+print('Installer checks passed: fresh-home command discovery, PATH-only repair, immediate user-bin access, collision protection, idempotence, quoting, and failed-install behavior.')
