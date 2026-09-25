@@ -1,4 +1,5 @@
 mod auth;
+mod discovery;
 mod jobs;
 mod store;
 mod sync;
@@ -54,6 +55,14 @@ struct FolderEditor {
 struct App {
     data: Data,
     connections: bool,
+    discovery_settings: bool,
+    discovery_networks: Vec<String>,
+    discovery_range: String,
+    discovery_port: u16,
+    discovery_scan: Option<discovery::Scan>,
+    discovered_hosts: Vec<discovery::Host>,
+    discovery_status: String,
+    discovery_error: Option<String>,
     host_ssh_status: Option<Result<bool, String>>,
     host_status_request: Option<mpsc::Receiver<Result<bool, String>>>,
     host_status_checked: Option<std::time::Instant>,
@@ -113,7 +122,22 @@ impl App {
             Ok(data) => (data, None),
             Err(e) => (Data::default(), Some(e)),
         };
+        let discovery_networks = discovery::local_networks();
+        let discovery_range = discovery_networks
+            .iter()
+            .find(|network| discovery::targets(network).is_ok())
+            .or(discovery_networks.first())
+            .cloned()
+            .unwrap_or_default();
         Self {
+            discovery_settings: false,
+            discovery_networks,
+            discovery_range,
+            discovery_port: 22,
+            discovery_scan: None,
+            discovered_hosts: Vec::new(),
+            discovery_status: "Scan to find SSH hosts on your network.".into(),
+            discovery_error: None,
             data,
             connections: false,
             host_ssh_status: None,
@@ -440,6 +464,38 @@ impl App {
         }
         self.status = "Removed from Codesync. Files remain in place.".into();
     }
+    fn poll_discovery(&mut self) {
+        let mut finished = None;
+        if let Some(scan) = &self.discovery_scan {
+            for event in scan.events.try_iter().take(256) {
+                match event {
+                    discovery::Event::Found(host) => {
+                        self.discovered_hosts.push(host);
+                    }
+                    discovery::Event::Progress(done, total) => {
+                        self.discovery_status = format!(
+                            "Scanning: {done}/{total} addresses; {} SSH hosts found",
+                            self.discovered_hosts.len()
+                        )
+                    }
+                    discovery::Event::Finished(cancelled) => finished = Some(cancelled),
+                }
+            }
+        }
+        if let Some(cancelled) = finished {
+            self.discovery_scan = None;
+            self.discovered_hosts.sort_by_key(|host| host.address);
+            self.discovery_status = format!(
+                "{}: {} SSH hosts found",
+                if cancelled {
+                    "Scan stopped"
+                } else {
+                    "Scan complete"
+                },
+                self.discovered_hosts.len()
+            );
+        }
+    }
     fn show_home(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let busy = self.job.is_some();
         self.home_folders
@@ -453,6 +509,7 @@ impl App {
         let mut add_server = false;
         let mut remove = None;
         let mut host_enabled = None;
+        let mut discovered_connection = None;
         ui.add_enabled_ui(!busy, |ui| {
             ui.columns(3, |columns| {
                 columns[0].heading("Folders");
@@ -534,9 +591,36 @@ impl App {
                 columns[2].label("Controls this computer's system SSH service and startup setting. Other hosts use their own switch.");
                 columns[2].label("Disabling stops new SSH connections; existing sessions may remain open.");
                 if columns[2].button("Refresh status").clicked() { self.refresh_host_status(ctx); }
+                columns[2].separator();
+                columns[2].strong("Network SSH hosts");
+                if columns[2].add_enabled(self.discovery_scan.is_none(), egui::Button::new("Scan network...")).clicked() { self.discovery_networks = discovery::local_networks(); self.discovery_settings = true; }
+                if let Some(scan) = &self.discovery_scan && columns[2].button("Stop scan").clicked() { scan.cancel(); }
+                columns[2].add(egui::Label::new(&self.discovery_status).wrap());
+                egui::ScrollArea::vertical().id_salt("network-hosts").max_height(240.0).show(&mut columns[2], |ui| {
+                    for (index, host) in self.discovered_hosts.iter().enumerate() {
+                        let saved = self.data.servers.iter().find(|server| server.host == host.address.to_string() && server.port == host.port);
+                        let label = saved.map(|server| server.name.clone()).unwrap_or_else(|| format!("SSH host {}", index + 1));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(label);
+                            if ui.small_button(if saved.is_some() { "Settings" } else { "Connect" }).clicked() { discovered_connection = Some((host.clone(), saved.map(|server| server.id))); }
+                        });
+                    }
+                });
+                columns[2].label("Addresses appear in connection settings. Discovery does not verify identity or grant access.");
+
 
             });
         });
+        if let Some((host, saved)) = discovered_connection {
+            self.edit_server(saved);
+            if saved.is_none()
+                && let Some(editor) = &mut self.server_editor
+            {
+                editor.server.name = "Network host".into();
+                editor.server.host = host.address.to_string();
+                editor.server.port = host.port;
+            }
+        }
         if let Some(item) = remove {
             self.remove_home_item(item);
         }
@@ -653,6 +737,39 @@ impl App {
         }
     }
     fn show_dialogs(&mut self, ctx: &egui::Context) {
+        if self.discovery_settings {
+            let mut open = true;
+            let mut start = false;
+            egui::Window::new("Scan network for SSH hosts").open(&mut open).collapsible(false).resizable(false).default_width(440.0).show(ctx, |ui| {
+                ui.label("Choose a connected IPv4 network or enter a smaller range. The scan checks the selected SSH port without logging in.");
+                egui::ComboBox::from_id_salt("discovery-network").selected_text("Connected networks").show_ui(ui, |ui| {
+                    for network in &self.discovery_networks { if ui.selectable_label(self.discovery_range == *network, network).clicked() { self.discovery_range = network.clone(); } }
+                });
+                field(ui, "IPv4 network", &mut self.discovery_range, "192.168.1.0/24", false);
+                ui.horizontal(|ui| { ui.label("SSH port"); ui.add(egui::DragValue::new(&mut self.discovery_port).range(1..=65535)); });
+                ui.label("Up to 4096 addresses per scan. Firewalls, slow responses, other ports, and IPv6-only hosts can keep devices out of this list.");
+                if let Some(error) = &self.discovery_error { ui.colored_label(Color32::DARK_RED, error); }
+                if ui.button("Scan").clicked() { start = true; }
+            });
+            if start {
+                self.discovery_error = None;
+                match discovery::Scan::start(
+                    &self.discovery_range,
+                    self.discovery_port,
+                    ctx.clone(),
+                ) {
+                    Ok(scan) => {
+                        self.discovery_scan = Some(scan);
+                        self.discovered_hosts.clear();
+                        self.discovery_status = "Scanning...".into();
+                        open = false;
+                    }
+                    Err(error) => self.discovery_error = Some(error),
+                }
+            }
+            self.discovery_settings = open;
+        }
+
         if let Some(mut editor) = self.folder_editor.take() {
             let mut open = true;
             let mut save = false;
@@ -1025,6 +1142,7 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, passwor
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll();
+        self.poll_discovery();
         if let Some(receiver) = &self.host_status_request
             && let Ok(status) = receiver.try_recv()
         {
@@ -1040,11 +1158,12 @@ impl eframe::App for App {
             self.refresh_host_status(ctx);
         }
         ctx.request_repaint_after(std::time::Duration::from_secs(15));
-        if self.job.is_some() {
+        if self.job.is_some() || self.discovery_scan.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let busy = self.job.is_some();
-        let dialog = self.connections
+        let dialog = self.discovery_settings
+            || self.connections
             || self.folder_editor.is_some()
             || self.server_editor.is_some()
             || self.link_editor.is_some()

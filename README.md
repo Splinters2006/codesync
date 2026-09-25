@@ -116,6 +116,20 @@ Edit a server to update its address or credentials. Edit a link to change its
 remote directory. Removing a server, folder, or link does not delete any files;
 removing a server or folder also removes its links from the app.
 
+## Find SSH hosts on your network
+
+In the **Hosts** column, click **Scan network...**, choose a connected IPv4 subnet,
+and click **Scan**. The default SSH port is 22; enter another port if needed.
+Reachable services with an SSH greeting appear in the list. Use **Connect** to
+prefill a new connection, or **Settings** for an existing one. Enter credentials
+and verify the fingerprint before syncing. Addresses stay inside settings.
+
+Scanning runs in the background and can be stopped. It does not log in or send
+credentials. Results last until the next scan or app restart. Scan each network
+separately; up to 4096 addresses are allowed per scan. This is not a complete
+inventory: blocked, slow, offline, IPv6-only, or differently configured SSH hosts
+may not appear. You can still add those hosts manually.
+
 ## Local, public, and Tailscale connections
 
 Server settings include separate local / primary and public addresses and ports.
