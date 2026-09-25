@@ -4,12 +4,15 @@ use std::{
 };
 
 const HELP: &str = "codesync — sync code and notes over SSH
-  codesync init USER@HOST /absolute/remote/folder
+  codesync init USER@HOST /absolute/remote/folder  Save settings and set up server
+  codesync setup                                Retry server setup
   codesync push [--dry-run]
   codesync pull [--dry-run]
   codesync run COMMAND [ARGS...]
   codesync shell
 Run from your project folder. Sync may overwrite files; preview with --dry-run.";
+
+const SETUP: &str = include_str!("setup.sh");
 
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -59,6 +62,13 @@ impl Config {
             cmd.arg("-t");
         }
         execute(cmd.arg(&self.host).arg(script))
+    }
+    fn setup(&self) -> Result<(), String> {
+        println!("Checking server dependencies on {}...", self.host);
+        self.ssh(&format!("sh -c {}", quote(SETUP)), true)
+            .map_err(|e| {
+                format!("Server setup failed: {e}. Settings are saved; retry with codesync setup.")
+            })
     }
     fn sync(&self, pull: bool, dry: bool) -> Result<(), String> {
         if !pull && !dry {
@@ -127,6 +137,13 @@ fn run() -> Result<(), String> {
                 .map_err(|e| format!("Cannot create .codesync: {e}"))?;
             writeln!(file, "{}\n{}", config.host, config.dir).map_err(|e| e.to_string())?;
             println!("Configured {}:{}", config.host, config.dir);
+            config.setup()?;
+        }
+        "setup" => {
+            if args.len() != 1 {
+                return Err("Usage: codesync setup".into());
+            }
+            Config::read()?.setup()?;
         }
         "push" | "pull" => {
             if args.len() > 2 || (args.len() == 2 && args[1] != "--dry-run") {
