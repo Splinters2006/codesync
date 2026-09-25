@@ -43,6 +43,7 @@ pub enum Action {
     Setup,
     Tailscale,
     PrepareHost,
+    DisableHost,
     Sync,
 }
 #[derive(Clone)]
@@ -87,6 +88,28 @@ impl Drop for Job {
     }
 }
 
+pub fn host_ssh_status() -> Result<bool, String> {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            include_str!("host-control.sh"),
+            "codesync-host-status",
+            "status",
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(
+            "Cannot read SSH status. A running systemd or OpenRC service manager is required."
+                .into(),
+        );
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "enabled" => Ok(true),
+        "disabled" => Ok(false),
+        _ => Err("Unexpected SSH service status.".into()),
+    }
+}
 fn ssh_args(server: &Server) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
@@ -178,19 +201,23 @@ fn run_tasks(
         if cancelled.load(Ordering::Relaxed) {
             return Err("Stopped. Completed transfers remain in place.".into());
         }
-        if matches!(task.action, Action::PrepareHost) {
-            Runner {
+        if matches!(task.action, Action::PrepareHost | Action::DisableHost) {
+            let mut runner = Runner {
                 task: &task,
                 bridge: &mut bridge,
                 cancelled,
                 events,
                 ctx,
+            };
+            if matches!(task.action, Action::DisableHost) {
+                runner.disable_host()?;
+            } else {
+                runner.setup_host(
+                    &host_setup_script(unsafe { libc::getuid() }),
+                    "incoming SSH connections",
+                    OutputMode::Live,
+                )?;
             }
-            .setup_host(
-                include_str!("host-setup.sh"),
-                "incoming SSH connections",
-                OutputMode::Live,
-            )?;
             continue;
         }
         task.server.validate()?;
@@ -217,7 +244,7 @@ fn run_tasks(
                 )?;
             }
             Action::Tailscale => runner.setup_tailscale()?,
-            Action::PrepareHost => unreachable!(),
+            Action::PrepareHost | Action::DisableHost => unreachable!(),
             Action::Sync => {
                 sync_tasks.push(task.clone());
                 continue;
@@ -804,6 +831,45 @@ fn resolve_endpoint(
     }
     Err("No configured address connected with the saved SSH identity and credentials. No files were transferred. Check the server's addresses, credentials, and network access.".into())
 }
+const STOP_SSH_HELPER: &str = "/usr/local/libexec/codesync-stop-ssh";
+fn stop_ssh_helper() -> String {
+    format!(
+        "#!/bin/sh\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\nexport PATH\nunset ENV BASH_ENV CDPATH\n[ \"$#\" -eq 0 ] || exit 2\nset -- disable\n{}",
+        include_str!("host-control.sh")
+    )
+}
+fn stop_ssh_policy(uid: u32) -> String {
+    format!(
+        "# Codesync: only stop SSH, never enable it or run arbitrary commands.\n#{uid} ALL=(root) NOPASSWD: NOSETENV: {STOP_SSH_HELPER} \"\"\n"
+    )
+}
+fn host_setup_script(uid: u32) -> String {
+    let policy_setup = if uid == 0 {
+        String::new()
+    } else {
+        format!(
+            r#"
+command -v sudo >/dev/null && command -v visudo >/dev/null || {{ echo 'Install sudo before preparing password-free SSH shutdown.' >&2; exit 1; }}
+umask 077
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT HUP INT TERM
+printf %s {helper} > "$work/helper"
+printf %s {policy} > "$work/policy"
+visudo -cf "$work/policy"
+install -d -o 0 -g 0 -m 0755 /usr/local/libexec
+install -o 0 -g 0 -m 0755 "$work/helper" {helper_path}
+install -d -o 0 -g 0 -m 0750 /etc/sudoers.d
+install -o 0 -g 0 -m 0440 "$work/policy" /etc/sudoers.d/codesync-stop-ssh-{uid}
+rm -rf -- "$work"
+trap - EXIT HUP INT TERM
+"#,
+            helper = codesync::quote(&stop_ssh_helper()),
+            policy = codesync::quote(&stop_ssh_policy(uid)),
+            helper_path = STOP_SSH_HELPER
+        )
+    };
+    format!("set -eu\n{policy_setup}\n{}", include_str!("host-setup.sh"))
+}
 fn privileged_remote(script: &str) -> String {
     let command = format!("sh -c {}", codesync::quote(script));
     format!(
@@ -832,6 +898,23 @@ fn tailscale_address(json: &str) -> Result<String, String> {
         .ok_or_else(|| "Tailscale did not return a server address.".into())
 }
 impl Runner<'_> {
+    fn disable_host(&mut self) -> Result<(), String> {
+        let mut command = if unsafe { libc::geteuid() } == 0 {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                &format!("set -- disable\n{}", include_str!("host-control.sh")),
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sudo");
+            command.args(["-n", "--", STOP_SSH_HELPER]);
+            command
+        };
+        // Never fall back to an interactive administrator prompt for Off.
+        command.env("SUDO_ASKPASS", "/bin/false");
+        self.execute(command, None).map_err(|e| format!("Could not turn SSH off without a password: {e} Run Connections > Prepare this host once to install the limited shutdown permission, then retry."))
+    }
     fn request_host_password(&self, purpose: &str) -> Result<String, String> {
         let (response, receiver) = mpsc::channel();
         self.events
@@ -1013,6 +1096,45 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn passwordless_stop_policy_is_limited_to_one_helper_without_arguments() {
+        let policy = stop_ssh_policy(1000);
+        assert!(policy.contains(
+            "#1000 ALL=(root) NOPASSWD: NOSETENV: /usr/local/libexec/codesync-stop-ssh \"\""
+        ));
+        assert!(!policy.contains("ALL=(ALL)"));
+        let scratch = super::super::sync::Scratch::new().unwrap();
+        let path = scratch.0.join("sudoers");
+        std::fs::write(&path, policy).unwrap();
+        if available("visudo") {
+            assert!(
+                Command::new("visudo")
+                    .arg("-cf")
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        for script in [stop_ssh_helper(), host_setup_script(1000)] {
+            assert!(
+                Command::new("sh")
+                    .args(["-n", "-c", &script])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert!(
+            Command::new("sh")
+                .args(["-c", &stop_ssh_helper(), "helper", "unexpected"])
+                .status()
+                .unwrap()
+                .code()
+                == Some(2)
+        );
+    }
+
     #[test]
     fn sync_group_end_to_end_with_local_ssh_transport() {
         use std::os::unix::fs::PermissionsExt;

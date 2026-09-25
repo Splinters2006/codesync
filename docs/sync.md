@@ -3,13 +3,25 @@
 Use **Connections** to add a reachable Linux host using its SSH address and
 account. On a computer that should receive connections, **Prepare this host to
 receive connections** installs SSH, rsync, and SHA-256 tools and starts SSH.
-This needs local administrator authorization. Both computers must be online;
+The Home page also has a **Hosts** column with **Accept SSH connections** for
+this computer. Uncheck it to stop SSH and disable startup/socket activation.
+Existing sessions may remain open. Each computer manages its own switch; stopping
+SSH remotely would prevent turning it back on over that connection.
+Enabling SSH needs local administrator authorization. Preparation also installs
+a root-owned `/usr/local/libexec/codesync-stop-ssh` helper and a per-user rule in
+`/etc/sudoers.d/codesync-stop-ssh-<uid>`. The rule permits only running that helper
+without arguments, without a password. Switching off uses noninteractive sudo
+and never falls back to a password prompt. Existing installations must run
+**Connections > Prepare this host** once after updating. `sudo` and `visudo` are
+required for this setup. Both computers must be online;
 a central server is optional. Connections use existing SSH accounts and pinned
 host fingerprints, not pairing codes. SSH access has the account's normal
 permissions; the folder selection is not an access-control sandbox.
 
 On Home, check folders on the left and hosts/servers on the right, then **Sync**.
-New links use `~/codesync/<folder name>`. Existing links retain their paths.
+New links use `~/codesync/<local directory name>`. Existing `codesync` parent targets also append the local directory name. Other
+explicit targets retain their paths. Files previously placed directly in a
+`codesync` parent are not automatically moved or deleted.
 
 ## Content rules
 

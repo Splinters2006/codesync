@@ -3,14 +3,16 @@
 The GUI opens on **Home**, with folders on the left and servers on the right.
 Check any number of each and click **Sync** to synchronize every selected
 folder with every selected server in both directions. New links use
-`~/codesync/<folder name>`; existing links keep their destinations. Conflicting
+`~/codesync/<local directory name>`; existing links keep their destinations. Conflicting
 folder names require distinct custom destinations before the batch can start.
 
-Use **Open** beside an item to manage its links, or **Add link** for a custom
-destination. One folder can link to multiple servers, and one server can link to multiple
+Use **Open** beside an item to manage its links in a settings popup, or
+**Add link** in that popup for a custom destination. One folder can link to multiple servers, and one server can link to multiple
 folders. Check the links to include, then use **Sync**. Files with different hashes are kept with host/server prefixes. Use **Select all** to include every visible link.
-Leave **Remote directory** empty to use `~/codesync` in the server user's home
-directory. Codesync creates it on the first sync. For additional
+Leave **Remote directory** empty, or enter `codesync`, to use
+`~/codesync/<local directory name>` in the server user's home directory. For
+example, `test4` syncs to `~/codesync/test4`. `/srv/codesync` similarly becomes
+`/srv/codesync/test4`. Codesync creates it on the first sync. For additional
 local folders on the same server, enter distinct absolute destinations to avoid
 mixing their contents.
 
@@ -55,5 +57,5 @@ If you configured the wrong *local* folder, enter the intended local folder and
 run init there. The old folder's config remains independent. Avoid mapping two
 local folders to the same remote destination, since uploads can overwrite files.
 
-To use the updated CLI, run `cargo install --path . --force` from the codesync
-source repository first.
+To install or update with automatic PATH setup, run `./install.sh` from the
+codesync source repository. Open a new terminal afterward.

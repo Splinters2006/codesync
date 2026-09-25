@@ -38,8 +38,8 @@ identity; ordinary address edits preserve the existing identity.
 
 1. Start while the server is reachable through an existing address, such as its
    home LAN address. Enter the server's login and sudo credentials.
-2. Click **Set up Tailscale** in Server properties or the server's main view. In
-   Server properties, the button saves the form first.
+2. Click **Open** beside the server, then **Set up Tailscale** in its settings
+   popup. The button saves the form first.
 3. Enter the host's sudo password in the dedicated dialog if requested. Codesync installs Tailscale
    if missing and enables its service on the host and server. The remote step
    uses the saved sudo password, root, or passwordless doas.

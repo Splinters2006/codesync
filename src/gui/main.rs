@@ -45,17 +45,24 @@ struct LinkEditor {
     link: Link,
     error: Option<String>,
 }
+struct FolderEditor {
+    id: u64,
+    name: String,
+    path: String,
+    error: Option<String>,
+}
 struct App {
     data: Data,
-    home: bool,
     connections: bool,
+    host_ssh_status: Option<Result<bool, String>>,
+    host_status_request: Option<mpsc::Receiver<Result<bool, String>>>,
+    host_status_checked: Option<std::time::Instant>,
     host_password_purpose: String,
     home_folders: HashSet<u64>,
     home_servers: HashSet<u64>,
     credentials: HashMap<u64, Credentials>,
-    selected: Option<Selection>,
-    selected_links: HashSet<u64>,
     server_editor: Option<ServerEditor>,
+    folder_editor: Option<FolderEditor>,
     link_editor: Option<LinkEditor>,
     new_folder: bool,
     folder_name: String,
@@ -106,22 +113,18 @@ impl App {
             Ok(data) => (data, None),
             Err(e) => (Data::default(), Some(e)),
         };
-        let selected = data
-            .folders
-            .first()
-            .map(|f| Selection::Folder(f.id))
-            .or_else(|| data.servers.first().map(|s| Selection::Server(s.id)));
         Self {
             data,
-            home: true,
             connections: false,
+            host_ssh_status: None,
+            host_status_request: None,
+            host_status_checked: None,
             host_password_purpose: String::new(),
             home_folders: HashSet::new(),
             home_servers: HashSet::new(),
             credentials: HashMap::new(),
-            selected,
-            selected_links: HashSet::new(),
             server_editor: None,
+            folder_editor: None,
             link_editor: None,
             new_folder: false,
             folder_name: String::new(),
@@ -167,13 +170,13 @@ impl App {
             error: None,
         });
     }
-    fn new_link(&mut self) {
-        let folder = match self.selected {
-            Some(Selection::Folder(id)) => id,
+    fn new_link(&mut self, selection: Selection) {
+        let folder = match selection {
+            Selection::Folder(id) => id,
             _ => self.data.folders.first().map_or(0, |f| f.id),
         };
-        let server = match self.selected {
-            Some(Selection::Server(id)) => id,
+        let server = match selection {
+            Selection::Server(id) => id,
             _ => self.data.servers.first().map_or(0, |s| s.id),
         };
         self.link_editor = Some(LinkEditor {
@@ -210,9 +213,7 @@ impl App {
         } else {
             self.folder_name.trim().into()
         };
-        let id = self.data.import_folder(name, path);
-        self.selected = Some(Selection::Folder(id));
-        self.selected_links.clear();
+        self.data.import_folder(name, path);
         self.persist();
         self.new_folder = false;
         self.folder_name.clear();
@@ -256,6 +257,7 @@ impl App {
             .find(|f| f.id == link.folder)?
             .path
             .clone();
+        let remote = store::remote_directory(&link.remote, &local).ok()?;
         Some(Task {
             credentials: self
                 .credentials
@@ -264,7 +266,7 @@ impl App {
                 .unwrap_or_default(),
             server,
             local,
-            remote: store::remote_directory(&link.remote),
+            remote,
             action,
         })
     }
@@ -334,6 +336,9 @@ impl App {
         if let Some(result) = finished {
             self.logins.clear();
             self.job = None;
+            self.host_status_checked = None;
+            self.host_ssh_status = None;
+            self.host_status_request = None;
             self.trust = None;
             self.host_password = None;
             self.host_password_input.clear();
@@ -356,17 +361,84 @@ impl App {
             }
         }
     }
-    fn visible_links(&self) -> Vec<Link> {
+    fn visible_links(&self, selection: Selection) -> Vec<Link> {
         self.data
             .links
             .iter()
-            .filter(|l| match self.selected {
-                Some(Selection::Folder(id)) => l.folder == id,
-                Some(Selection::Server(id)) => l.server == id,
-                None => false,
+            .filter(|l| match selection {
+                Selection::Folder(id) => l.folder == id,
+                Selection::Server(id) => l.server == id,
             })
             .cloned()
             .collect()
+    }
+    fn refresh_host_status(&mut self, ctx: &egui::Context) {
+        if self.host_status_request.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        self.host_status_request = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(jobs::host_ssh_status());
+            ctx.request_repaint();
+        });
+    }
+    fn set_host_connections(&mut self, enabled: bool, ctx: &egui::Context) {
+        self.start(
+            vec![Task {
+                server: Server {
+                    id: 0,
+                    name: "This host".into(),
+                    host: "localhost".into(),
+                    user: String::new(),
+                    port: 22,
+                    network: Default::default(),
+                },
+                credentials: Credentials::default(),
+                local: std::env::temp_dir(),
+                remote: String::new(),
+                action: if enabled {
+                    Action::PrepareHost
+                } else {
+                    Action::DisableHost
+                },
+            }],
+            if enabled {
+                "Enabling incoming SSH"
+            } else {
+                "Disabling incoming SSH"
+            },
+            ctx,
+        );
+    }
+    fn remove_home_item(&mut self, item: Selection) {
+        let mut data = self.data.clone();
+        match item {
+            Selection::Folder(id) => {
+                data.folders.retain(|f| f.id != id);
+                data.links.retain(|l| l.folder != id);
+            }
+            Selection::Server(id) => {
+                data.servers.retain(|s| s.id != id);
+                data.links.retain(|l| l.server != id);
+            }
+        }
+        if let Err(e) = store::save(&data) {
+            self.error = Some(e);
+            return;
+        }
+        self.data = data;
+        match item {
+            Selection::Folder(id) => {
+                self.home_folders.remove(&id);
+            }
+            Selection::Server(id) => {
+                self.home_servers.remove(&id);
+                self.credentials.remove(&id);
+            }
+        }
+        self.status = "Removed from Codesync. Files remain in place.".into();
     }
     fn show_home(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let busy = self.job.is_some();
@@ -379,8 +451,10 @@ impl App {
         let mut open_folder = None;
         let mut open_server = None;
         let mut add_server = false;
+        let mut remove = None;
+        let mut host_enabled = None;
         ui.add_enabled_ui(!busy, |ui| {
-            ui.columns(2, |columns| {
+            ui.columns(3, |columns| {
                 columns[0].heading("Folders");
                 columns[0].separator();
                 ui_home_select_all(
@@ -393,7 +467,7 @@ impl App {
                     .max_height(300.0)
                     .show(&mut columns[0], |ui| {
                         for folder in &self.data.folders {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 let mut checked = self.home_folders.contains(&folder.id);
                                 if ui.checkbox(&mut checked, &folder.name).changed() {
                                     if checked {
@@ -402,9 +476,8 @@ impl App {
                                         self.home_folders.remove(&folder.id);
                                     }
                                 }
-                                if ui.small_button("Open").clicked() {
-                                    open_folder = Some(folder.id);
-                                }
+                                if ui.small_button("Open").clicked() { open_folder = Some(folder.id); }
+                                if ui.small_button("Remove").on_hover_text("Remove this folder and its links from Codesync. Files remain in place.").clicked() { remove = Some(Selection::Folder(folder.id)); }
                             });
                         }
                         if self.data.folders.is_empty() {
@@ -426,7 +499,7 @@ impl App {
                     .max_height(300.0)
                     .show(&mut columns[1], |ui| {
                         for server in &self.data.servers {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 let mut checked = self.home_servers.contains(&server.id);
                                 if ui.checkbox(&mut checked, &server.name).changed() {
                                     if checked {
@@ -435,9 +508,8 @@ impl App {
                                         self.home_servers.remove(&server.id);
                                     }
                                 }
-                                if ui.small_button("Open").clicked() {
-                                    open_server = Some(server.id);
-                                }
+                                if ui.small_button("Open").clicked() { open_server = Some(server.id); }
+                                if ui.small_button("Remove").on_hover_text("Remove this server and its links from Codesync. Remote files remain in place.").clicked() { remove = Some(Selection::Server(server.id)); }
                             });
                         }
                         if self.data.servers.is_empty() {
@@ -447,20 +519,45 @@ impl App {
                 if columns[1].button("Add server...").clicked() {
                     add_server = true;
                 }
+                columns[2].heading("Hosts");
+                columns[2].separator();
+                columns[2].strong("This host");
+                let known = matches!(self.host_ssh_status, Some(Ok(_)));
+                let mut enabled = matches!(self.host_ssh_status, Some(Ok(true)));
+                if columns[2].add_enabled(known && self.host_status_request.is_none(), egui::Checkbox::new(&mut enabled, "Accept SSH connections")).changed() { host_enabled = Some(enabled); }
+                match &self.host_ssh_status {
+                    Some(Ok(true)) => { columns[2].label("Incoming SSH is enabled."); }
+                    Some(Ok(false)) => { columns[2].label("Incoming SSH is stopped."); }
+                    Some(Err(error)) => { columns[2].label(error); }
+                    None => { columns[2].label("Checking SSH status..."); }
+                }
+                columns[2].label("Controls this computer's system SSH service and startup setting. Other hosts use their own switch.");
+                columns[2].label("Disabling stops new SSH connections; existing sessions may remain open.");
+                if columns[2].button("Refresh status").clicked() { self.refresh_host_status(ctx); }
+
             });
         });
+        if let Some(item) = remove {
+            self.remove_home_item(item);
+        }
+        if let Some(enabled) = host_enabled {
+            self.set_host_connections(enabled, ctx);
+        }
         if add_server {
             self.edit_server(None);
         }
-        if let Some(id) = open_folder {
-            self.selected = Some(Selection::Folder(id));
-            self.home = false;
-            self.selected_links.clear();
+        if let Some(id) = open_folder
+            && let Some(folder) = self.data.folders.iter().find(|folder| folder.id == id)
+        {
+            self.folder_editor = Some(FolderEditor {
+                id,
+                name: folder.name.clone(),
+                path: folder.path.display().to_string(),
+                error: None,
+            });
         }
         if let Some(id) = open_server {
-            self.selected = Some(Selection::Server(id));
-            self.home = false;
-            self.selected_links.clear();
+            self.edit_server(Some(id));
         }
         ui.separator();
         ui.label(format!(
@@ -469,7 +566,7 @@ impl App {
             self.home_servers.len(),
             self.home_folders.len() * self.home_servers.len()
         ));
-        ui.label("Existing links keep their destination. New links use ~/codesync/<folder name> on each server, keeping folders separate.");
+        ui.label("A codesync target uses ~/codesync/<local folder name> on each server. Other explicit destinations stay as entered.");
         let ready = !busy && !self.home_folders.is_empty() && !self.home_servers.is_empty();
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(ready, egui::Button::new("Sync")).clicked() {
@@ -503,229 +600,135 @@ impl App {
         });
         ui.label("Sync compares SHA-256 hashes. Different versions get host/server prefixes. Missing files are copied; deletions are not propagated.");
     }
-    fn show_details(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let busy = self.job.is_some();
-        match self.selected {
-            Some(Selection::Folder(id)) => {
-                if let Some(folder) = self.data.folders.iter().find(|f| f.id == id).cloned() {
-                    ui.heading(&folder.name);
-                    ui.label(folder.path.display().to_string());
-                    ui.label(
-                        "Link this folder to one or more servers. Check the server links to sync.",
-                    );
+    fn show_link_settings(&mut self, ui: &mut egui::Ui, selection: Selection) {
+        ui.separator();
+        ui.strong("Folder / server links");
+        if ui
+            .add_enabled(
+                !self.data.folders.is_empty() && !self.data.servers.is_empty(),
+                egui::Button::new("Add link..."),
+            )
+            .clicked()
+        {
+            self.new_link(selection);
+        }
+        for link in self.visible_links(selection) {
+            let label = match selection {
+                Selection::Folder(_) => self
+                    .data
+                    .servers
+                    .iter()
+                    .find(|s| s.id == link.server)
+                    .map(|s| s.name.clone()),
+                Selection::Server(_) => self
+                    .data
+                    .folders
+                    .iter()
+                    .find(|f| f.id == link.folder)
+                    .map(|f| f.name.clone()),
+            }
+            .unwrap_or_else(|| "Missing item".into());
+            ui.push_id(link.id, |ui| {
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(label).strong()).wrap());
+                ui.add(egui::Label::new(&link.remote).wrap());
+                ui.horizontal(|ui| {
+                    if ui.small_button("Edit").clicked() {
+                        self.link_editor = Some(LinkEditor {
+                            link: link.clone(),
+                            error: None,
+                        });
+                    }
                     if ui
-                        .add_enabled(!busy, egui::Button::new("Remove folder from list"))
-                        .on_hover_text("Removes its links. No local or remote files are deleted.")
+                        .small_button("Unlink")
+                        .on_hover_text("Files remain in place")
                         .clicked()
                     {
-                        self.data.folders.retain(|f| f.id != id);
-                        self.data.links.retain(|l| l.folder != id);
-                        self.selected = None;
-                        self.selected_links.clear();
+                        self.data.links.retain(|l| l.id != link.id);
                         self.persist();
-                        return;
+                    }
+                });
+                ui.separator();
+            });
+        }
+    }
+    fn show_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(mut editor) = self.folder_editor.take() {
+            let mut open = true;
+            let mut save = false;
+            egui::Window::new("Folder settings")
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(500.0)
+                .vscroll(true)
+                .show(ctx, |ui| {
+                    ui.add_enabled_ui(self.job.is_none() && self.link_editor.is_none(), |ui| {
+                        field(ui, "Name", &mut editor.name, "Notes", false);
+                        field(
+                            ui,
+                            "Local directory",
+                            &mut editor.path,
+                            "/home/user/notes",
+                            false,
+                        );
+                        ui.label(
+                            "Changing this path changes which folder syncs. Files are not moved.",
+                        );
+                        if let Some(error) = &editor.error {
+                            ui.colored_label(Color32::DARK_RED, error);
+                        }
+                        if ui.button("Save").clicked() {
+                            save = true;
+                        }
+                        self.show_link_settings(ui, Selection::Folder(editor.id));
+                    });
+                });
+            if save {
+                let path = if let Some(rest) = editor.path.trim().strip_prefix("~/") {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_default()
+                        .join(rest)
+                } else {
+                    PathBuf::from(editor.path.trim())
+                };
+                match path.canonicalize() {
+                    Ok(path) if path.is_dir() && !editor.name.trim().is_empty() => {
+                        if self
+                            .data
+                            .folders
+                            .iter()
+                            .any(|f| f.id != editor.id && f.path == path)
+                        {
+                            editor.error =
+                                Some("That directory is already in the folder list.".into());
+                        } else {
+                            let mut data = self.data.clone();
+                            if let Some(folder) =
+                                data.folders.iter_mut().find(|f| f.id == editor.id)
+                            {
+                                folder.name = editor.name.trim().into();
+                                folder.path = path;
+                            }
+                            match store::save(&data) {
+                                Ok(()) => {
+                                    self.data = data;
+                                    open = false;
+                                }
+                                Err(e) => editor.error = Some(e),
+                            }
+                        }
+                    }
+                    _ => {
+                        editor.error = Some("Enter a name and an existing local directory.".into())
                     }
                 }
             }
-            Some(Selection::Server(id)) => {
-                if let Some(server) = self.data.servers.iter().find(|s| s.id == id).cloned() {
-                    ui.heading(&server.name);
-                    ui.label(match server.network.mode {
-                        ConnectionMode::Automatic => {
-                            "Connection: Automatic (Tailscale, local, then public)"
-                        }
-                        ConnectionMode::LocalOnly => "Connection: Local only",
-                        ConnectionMode::RemoteOnly => {
-                            "Connection: Remote only (Tailscale, then public)"
-                        }
-                    });
-                    let ready = self
-                        .credentials
-                        .get(&id)
-                        .is_some_and(|c| !c.login.is_empty());
-                    ui.label(if ready {
-                        "Login password available for this session."
-                    } else {
-                        "Using SSH keys / agent. Edit server to enter a login password."
-                    });
-                    ui.add_enabled_ui(!busy, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("Edit server / passwords").clicked() {
-                                self.edit_server(Some(id));
-                            }
-                            if ui.button("Test connection").clicked() {
-                                self.server_action(id, Action::Test, ctx);
-                            }
-                            if ui.button("Set up Tailscale").clicked() {
-                                self.server_action(id, Action::Tailscale, ctx);
-                            }
-                            if ui.button("Set up server").clicked() {
-                                self.server_action(id, Action::Setup, ctx);
-                            }
-                            if ui
-                                .button("Remove server")
-                                .on_hover_text("Removes its links. No remote files are deleted.")
-                                .clicked()
-                            {
-                                self.data.servers.retain(|s| s.id != id);
-                                self.data.links.retain(|l| l.server != id);
-                                self.credentials.remove(&id);
-                                self.selected = None;
-                                self.selected_links.clear();
-                                self.persist();
-                            }
-                        });
-                    });
-                }
-            }
-            None => {
-                ui.heading("File Synchronization");
-                ui.label("1. Add a server and enter its address and credentials.");
-                ui.label("2. Add the local folders you want to sync.");
-                ui.label("3. Link folders to servers and choose each remote directory.");
-                return;
+            if open {
+                self.folder_editor = Some(editor);
             }
         }
-        ui.separator();
-        let links = self.visible_links();
-        self.selected_links
-            .retain(|id| links.iter().any(|link| link.id == *id));
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("Folder / server links");
-            if ui
-                .add_enabled(
-                    !busy && !self.data.folders.is_empty() && !self.data.servers.is_empty(),
-                    egui::Button::new("Add link..."),
-                )
-                .clicked()
-            {
-                self.new_link();
-            }
-            if ui
-                .add_enabled(!busy && !links.is_empty(), egui::Button::new("Select all"))
-                .clicked()
-            {
-                self.selected_links.extend(links.iter().map(|link| link.id));
-            }
-            if ui
-                .add_enabled(
-                    !busy && !self.selected_links.is_empty(),
-                    egui::Button::new("Clear selection"),
-                )
-                .clicked()
-            {
-                self.selected_links.clear();
-            }
-            ui.label(format!("{} selected", self.selected_links.len()));
-        });
-        egui::Frame::new()
-            .fill(Color32::WHITE)
-            .stroke(egui::Stroke::new(1.0_f32, Color32::GRAY))
-            .inner_margin(6.0)
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    egui::Grid::new("links")
-                        .striped(true)
-                        .min_col_width(110.0)
-                        .show(ui, |ui| {
-                            ui.label("");
-                            ui.strong("Local folder");
-                            ui.strong("Server");
-                            ui.strong("Remote folder");
-                            ui.end_row();
-                            for link in &links {
-                                let folder = self
-                                    .data
-                                    .folders
-                                    .iter()
-                                    .find(|f| f.id == link.folder)
-                                    .map_or("Missing folder", |f| &f.name);
-                                let server = self
-                                    .data
-                                    .servers
-                                    .iter()
-                                    .find(|s| s.id == link.server)
-                                    .map_or("Missing server", |s| &s.name);
-                                let mut checked = self.selected_links.contains(&link.id);
-                                if ui
-                                    .add_enabled(!busy, egui::Checkbox::without_text(&mut checked))
-                                    .changed()
-                                {
-                                    if checked {
-                                        self.selected_links.insert(link.id);
-                                    } else {
-                                        self.selected_links.remove(&link.id);
-                                    }
-                                }
-                                for label in [folder, server] {
-                                    if ui
-                                        .add_enabled(
-                                            !busy,
-                                            egui::Button::selectable(
-                                                self.selected_links.contains(&link.id),
-                                                label,
-                                            ),
-                                        )
-                                        .clicked()
-                                        && !self.selected_links.remove(&link.id)
-                                    {
-                                        self.selected_links.insert(link.id);
-                                    }
-                                }
-                                ui.label(&link.remote);
-                                ui.end_row();
-                            }
-                        });
-                });
-                if links.is_empty() {
-                    ui.label("No links yet. Add a link to choose a server and remote directory.");
-                }
-            });
-        let selected: Vec<_> = links
-            .iter()
-            .filter(|link| self.selected_links.contains(&link.id))
-            .cloned()
-            .collect();
-        ui.add_enabled_ui(!busy && !selected.is_empty(), |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Sync").clicked() {
-                    let tasks = selected
-                        .iter()
-                        .filter_map(|link| self.task(link, Action::Sync))
-                        .collect();
-                    self.start(tasks, "Syncing selected folders", ctx);
-                }
-                if ui
-                    .add_enabled(selected.len() == 1, egui::Button::new("Edit link"))
-                    .clicked()
-                {
-                    self.link_editor = Some(LinkEditor {
-                        link: selected[0].clone(),
-                        error: None,
-                    });
-                }
-                if ui
-                    .button("Unlink selected")
-                    .on_hover_text("No files are deleted")
-                    .clicked()
-                {
-                    self.data
-                        .links
-                        .retain(|link| !self.selected_links.contains(&link.id));
-                    self.selected_links.clear();
-                    self.persist();
-                }
-            });
-        });
-        ui.label(
-            RichText::new(
-                "Sync keeps different versions with host/server prefixes. No deletions are propagated.",
-            )
-            .small(),
-        );
-    }
-    fn show_dialogs(&mut self, ctx: &egui::Context) {
+
         if self.connections {
             let mut open = true;
             let mut connect = false;
@@ -738,7 +741,7 @@ impl App {
                     if ui.button("Connect another host...").clicked() { connect = true; }
                     ui.label("Enter its address and SSH account. Verify its fingerprint before syncing.");
                     if ui.button("Prepare this host to receive connections").clicked() { prepare = true; }
-                    ui.label("Installs OpenSSH server, rsync, and SHA-256 tools, then enables SSH at startup. SSH grants access with that account's permissions, beyond the folders selected in Codesync. Existing SSH settings and firewall rules are preserved.");
+                    ui.label("Installs OpenSSH server, rsync, and SHA-256 tools, enables SSH at startup, and grants this account permission to stop SSH without a password. SSH grants access with that account's permissions, beyond the folders selected in Codesync. Existing SSH settings and firewall rules are preserved.");
                 });
                 ui.label("On the other host, add this host using its reachable address, SSH port, and account. Files sync when you click Sync; no pairing code or background sync is required.");
             });
@@ -749,24 +752,7 @@ impl App {
             }
             if prepare {
                 self.connections = false;
-                self.start(
-                    vec![Task {
-                        server: Server {
-                            id: 0,
-                            name: "This host".into(),
-                            host: "localhost".into(),
-                            user: String::new(),
-                            port: 22,
-                            network: Default::default(),
-                        },
-                        credentials: Credentials::default(),
-                        local: std::env::temp_dir(),
-                        remote: String::new(),
-                        action: Action::PrepareHost,
-                    }],
-                    "Preparing this host for connections",
-                    ctx,
-                );
+                self.set_host_connections(true, ctx);
             }
         }
 
@@ -775,7 +761,9 @@ impl App {
             let mut save = false;
             let mut setup = false;
             let mut tailscale = false;
-            egui::Window::new("Server properties").open(&mut open).collapsible(false).resizable(false).default_width(470.0).vscroll(true).max_height(650.0).show(ctx, |ui| {
+            let mut test = false;
+            egui::Window::new("Server settings").open(&mut open).collapsible(false).resizable(false).default_width(470.0).vscroll(true).max_height(650.0).show(ctx, |ui| {
+                ui.add_enabled_ui(self.job.is_none() && self.link_editor.is_none(), |ui| {
                 field(ui, "Name", &mut editor.server.name, "Home server", false);
                 field(ui, "Local / primary address", &mut editor.server.host, "192.168.1.10", false);
                 ui.horizontal(|ui| { ui.label("Local / primary SSH port"); ui.add(egui::DragValue::new(&mut editor.server.port).range(1..=65535)); });
@@ -806,6 +794,9 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() { save = true; }
                     if ui.button("Save & set up").clicked() { save = true; setup = true; }
+                    if ui.button("Test connection").clicked() { save = true; test = true; }
+                });
+                if self.data.servers.iter().any(|server| server.id == editor.server.id) { self.show_link_settings(ui, Selection::Server(editor.server.id)); }
                 });
             });
             if save {
@@ -824,13 +815,13 @@ impl App {
                             self.data.servers.push(editor.server);
                         }
                         self.credentials.insert(id, editor.credentials);
-                        self.selected = Some(Selection::Server(id));
-                        self.selected_links.clear();
                         self.persist();
                         if tailscale {
                             self.server_action(id, Action::Tailscale, ctx);
                         } else if setup {
                             self.server_action(id, Action::Setup, ctx);
+                        } else if test {
+                            self.server_action(id, Action::Test, ctx);
                         }
                     }
                     Err(e) => {
@@ -930,10 +921,10 @@ impl App {
                         ui,
                         "Remote directory",
                         &mut editor.link.remote,
-                        "Leave empty for ~/codesync on the server",
+                        "Leave empty for ~/codesync/<local folder name>",
                         false,
                     );
-                    ui.label("Leave empty to use codesync in the server user's home directory. It is created on the first sync.");
+                    ui.label("Empty or codesync targets use ~/codesync/<local folder name>. For example, test4 syncs to ~/codesync/test4. The directory is created on the first sync.");
                     ui.label("Adding a link does not move or transfer files.");
                     if let Some(error) = &editor.error {
                         ui.colored_label(Color32::DARK_RED, error);
@@ -943,11 +934,9 @@ impl App {
                     }
                 });
             if save {
-                editor.link.remote = store::remote_directory(&editor.link.remote);
+                editor.link.remote = editor.link.remote.trim().into();
                 match self.data.validate_link(&editor.link) {
                     Ok(()) => {
-                        self.selected_links.clear();
-                        self.selected_links.insert(editor.link.id);
                         if let Some(link) =
                             self.data.links.iter_mut().find(|l| l.id == editor.link.id)
                         {
@@ -971,7 +960,7 @@ impl App {
             egui::Modal::new(egui::Id::new("host-password")).show(ctx, |ui| {
                 ui.set_max_width(430.0);
                 ui.heading("Host administrator password");
-                ui.label(format!("Enter this host's sudo password to set up {}. It is used only for this step and is not saved.", self.host_password_purpose));
+                ui.label(format!("Enter this host's sudo password to authorize {}. It is used only for this step and is not saved.", self.host_password_purpose));
                 field(ui, "Host password", &mut self.host_password_input, "", true);
                 ui.horizontal(|ui| {
                     if ui.button("Continue").clicked() { answer = Some(true); }
@@ -1036,11 +1025,27 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, passwor
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll();
+        if let Some(receiver) = &self.host_status_request
+            && let Ok(status) = receiver.try_recv()
+        {
+            self.host_ssh_status = Some(status);
+            self.host_status_request = None;
+            self.host_status_checked = Some(std::time::Instant::now());
+        }
+        if self.job.is_none()
+            && self
+                .host_status_checked
+                .is_none_or(|time| time.elapsed() > std::time::Duration::from_secs(15))
+        {
+            self.refresh_host_status(ctx);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(15));
         if self.job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let busy = self.job.is_some();
         let dialog = self.connections
+            || self.folder_editor.is_some()
             || self.server_editor.is_some()
             || self.link_editor.is_some()
             || self.new_folder;
@@ -1052,12 +1057,6 @@ impl eframe::App for App {
                     .clicked()
                 {
                     self.connections = true;
-                }
-                if ui
-                    .add_enabled(!dialog, egui::Button::selectable(self.home, "Home"))
-                    .clicked()
-                {
-                    self.home = true;
                 }
                 ui.separator();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1080,71 +1079,10 @@ impl eframe::App for App {
                 ));
             });
         });
-        if !self.home {
-            egui::SidePanel::left("navigation")
-                .default_width(210.0)
-                .min_width(150.0)
-                .resizable(true)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.add_enabled_ui(!busy && !dialog, |ui| {
-                            ui.strong("Local folders");
-                            ui.separator();
-                            for folder in &self.data.folders {
-                                let selection = Selection::Folder(folder.id);
-                                if ui
-                                    .selectable_label(
-                                        self.selected == Some(selection),
-                                        &folder.name,
-                                    )
-                                    .on_hover_text(folder.path.display().to_string())
-                                    .clicked()
-                                {
-                                    self.selected = Some(selection);
-                                    self.selected_links.clear();
-                                }
-                            }
-                            if self.data.folders.is_empty() {
-                                ui.label("No folders added");
-                            }
-                            if ui.button("Add folder...").clicked() {
-                                self.new_folder = true;
-                                self.error = None;
-                            }
-                            ui.add_space(18.0);
-                            ui.strong("Servers");
-                            ui.separator();
-                            for server in &self.data.servers {
-                                let selection = Selection::Server(server.id);
-                                if ui
-                                    .selectable_label(
-                                        self.selected == Some(selection),
-                                        &server.name,
-                                    )
-                                    .clicked()
-                                {
-                                    self.selected = Some(selection);
-                                    self.selected_links.clear();
-                                }
-                            }
-                            if self.data.servers.is_empty() {
-                                ui.label("No servers added");
-                            }
-                            if ui.button("Add server...").clicked() {
-                                self.edit_server(None);
-                            }
-                        });
-                    });
-                });
-        }
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_enabled_ui(!dialog, |ui| {
-                    if self.home {
-                        self.show_home(ui, ctx);
-                    } else {
-                        self.show_details(ui, ctx);
-                    }
+                    self.show_home(ui, ctx);
                 });
                 ui.separator();
                 ui.horizontal(|ui| {

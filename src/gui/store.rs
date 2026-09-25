@@ -4,12 +4,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub fn remote_directory(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        "codesync".into()
+pub fn remote_directory(input: &str, local: &Path) -> Result<String, String> {
+    let trimmed = input.trim().trim_end_matches('/');
+    let base = if trimmed.is_empty() && input.trim().is_empty() || trimmed == "~/codesync" {
+        "codesync"
     } else {
-        trimmed.into()
+        trimmed
+    };
+    if base == "codesync" || (base.starts_with('/') && base.ends_with("/codesync")) {
+        let name = local.file_name().and_then(|name| name.to_str()).filter(|name| !name.is_empty()).ok_or("Choose a local folder with a valid directory name, or enter an explicit remote path.")?;
+        Ok(format!("{base}/{name}"))
+    } else {
+        Ok(input.trim().into())
     }
 }
 
@@ -163,28 +169,11 @@ impl Data {
                     links.push(link.clone());
                     continue;
                 }
-                let name: String = folder
-                    .name
-                    .chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || "._- ".contains(c) {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                let name = name.trim();
-                let name = if name.is_empty() || name == "." || name == ".." {
-                    format!("folder-{}", folder.id)
-                } else {
-                    name.to_owned()
-                };
                 let link = Link {
                     id: data.next_id(),
                     folder: folder.id,
                     server: server.id,
-                    remote: format!("codesync/{name}"),
+                    remote: remote_directory("codesync", &folder.path)?,
                 };
                 data.validate_link(&link).map_err(|e| format!("Cannot link {} to {}: {e} Open the folder and add a link with a distinct remote directory.", folder.name, server.name))?;
                 data.links.push(link.clone());
@@ -213,9 +202,12 @@ impl Data {
         maximum.max(now)
     }
     pub fn validate_link(&self, link: &Link) -> Result<(), String> {
-        if !self.folders.iter().any(|f| f.id == link.folder) {
-            return Err("Choose a local folder.".into());
-        }
+        let folder = self
+            .folders
+            .iter()
+            .find(|f| f.id == link.folder)
+            .ok_or("Choose a local folder.")?;
+        let remote = remote_directory(&link.remote, &folder.path)?;
         let server = self
             .servers
             .iter()
@@ -223,7 +215,7 @@ impl Data {
             .ok_or("Choose a server.")?;
         codesync::Config {
             host: server.destination(),
-            dir: remote_directory(&link.remote),
+            dir: remote.clone(),
         }
         .validate()?;
         if self
@@ -238,8 +230,14 @@ impl Data {
         if self.links.iter().any(|l| {
             l.id != link.id
                 && l.server == link.server
-                && remote_directory(&l.remote).trim_end_matches('/')
-                    == remote_directory(&link.remote).trim_end_matches('/')
+                && self
+                    .folders
+                    .iter()
+                    .find(|f| f.id == l.folder)
+                    .and_then(|f| remote_directory(&l.remote, &f.path).ok())
+                    .is_some_and(|existing| {
+                        existing.trim_end_matches('/') == remote.trim_end_matches('/')
+                    })
         }) {
             return Err("Another folder already uses this destination on that server.".into());
         }
@@ -388,7 +386,7 @@ mod tests {
         assert_eq!(links.len(), 6);
         assert_eq!(shared.links.len(), 6);
         assert_eq!(links[0].remote, "/srv/existing");
-        assert_eq!(links[1].remote, "codesync/Folder 4");
+        assert_eq!(links[1].remote, "codesync/folder4");
         assert_eq!(
             links
                 .iter()
@@ -407,7 +405,7 @@ mod tests {
             6
         );
         assert_eq!(data.links.len(), 1);
-        data.folders[1].name = data.folders[0].name.clone();
+        data.folders[1].path = "/other/folder4".into();
         assert!(data.share_links(&folders, &servers).is_err());
         assert_eq!(data.links.len(), 1);
         assert!(
@@ -417,10 +415,11 @@ mod tests {
     }
 
     #[test]
-    fn blank_remote_directory_defaults_to_home_codesync() {
-        for input in ["", "   ", "codesync"] {
-            let dir = remote_directory(input);
-            assert_eq!(dir, "codesync");
+    fn codesync_parent_keeps_the_local_directory_name() {
+        let local = Path::new("/work/test4");
+        for input in ["", "   ", "codesync", "codesync/", "~/codesync"] {
+            let dir = remote_directory(input, local).unwrap();
+            assert_eq!(dir, "codesync/test4");
             assert!(
                 codesync::Config {
                     host: "user@server".into(),
@@ -430,10 +429,23 @@ mod tests {
                 .is_ok()
             );
         }
-        assert_eq!(remote_directory(" /srv/notes "), "/srv/notes");
         assert_eq!(
-            codesync::rsync_destination("user@server", &remote_directory("")),
-            "user@server:codesync/"
+            remote_directory("/srv/codesync/", local).unwrap(),
+            "/srv/codesync/test4"
+        );
+        assert_eq!(
+            remote_directory("codesync/test4", local).unwrap(),
+            "codesync/test4"
+        );
+        assert_eq!(
+            remote_directory(" /srv/notes ", local).unwrap(),
+            "/srv/notes"
+        );
+        assert_eq!(remote_directory("/", local).unwrap(), "/");
+        assert!(remote_directory("codesync", Path::new("/")).is_err());
+        assert_eq!(
+            codesync::rsync_destination("user@server", &remote_directory("", local).unwrap()),
+            "user@server:codesync/test4/"
         );
     }
 

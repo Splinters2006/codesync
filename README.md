@@ -12,17 +12,23 @@ enter a path manually. Native Windows support is not implemented.
 From this repository:
 
 ```sh
-cargo install --path . --force
-codesync gui
+./install.sh
 ```
 
-You can also launch `codesync-gui` directly. If the shell cannot find it, run
-`export PATH="$HOME/.cargo/bin:$PATH"` and add that line to `~/.bashrc` once.
+The installer runs Cargo and adds its installation directory to PATH for Bash,
+Zsh, or Fish. Open a new terminal, then run `codesync gui` from any directory.
+It also prints a direct command to launch immediately in the current terminal.
+Reinstalling does not duplicate PATH entries. No root privileges are needed.
+`CARGO_INSTALL_ROOT` and `CARGO_HOME` are respected.
+
 For a CLI-only installation:
 
 ```sh
-cargo install --path . --force --no-default-features --bin codesync
+./install.sh --cli-only
 ```
+
+You can still run `cargo install --path . --force` directly, but Cargo itself does
+not update shell startup files. Use the installer for automatic PATH setup.
 
 ## Add servers and folders
 
@@ -34,12 +40,25 @@ cargo install --path . --force --no-default-features --bin codesync
 3. Click **Add folder** and choose an existing local directory.
 4. On **Home**, check folders on the left and servers on the right, then click
    **Sync**. Each selected folder is synchronized in both directions across all
-   selected servers. New links use `~/codesync/<folder name>`; existing destinations
+   selected servers. New links use `~/codesync/<local directory name>`; existing destinations
    are preserved. First-time connections ask you to verify the server fingerprint.
 
-Use **Open** beside a folder or server to manage its links and settings. For a
-custom destination, choose **Add link** and enter an absolute remote directory.
-Return using **Home** in the toolbar. Use **Connections** to connect another Linux
+Use **Open** beside a folder or server to open its settings popup.
+Folder settings include its name, local directory, and links. Server settings
+include addresses, credentials, connection tests, setup, and links. Incoming SSH controls are in the **Hosts** column on Home. For a custom destination, choose **Add link** in
+folder or server settings and enter an absolute remote directory.
+Home includes **Remove** buttons for folders and servers. They remove the entry
+and its links from Codesync, leaving all files in place. The third **Hosts** column
+shows this computer's **Accept SSH connections** checkbox. Checking it installs
+and enables SSH; unchecking it stops and disables the system SSH service and any
+SSH socket activation. Existing SSH sessions may remain open. The switch reflects
+actual service status and refreshes periodically. Enabling SSH requires
+administrator authorization. Host preparation installs a root-owned stop helper
+and a per-user sudo rule limited to that helper, so switching SSH off does not
+prompt for a password. After updating an older installation, run **Connections >
+Prepare this host** once to install that permission. Each computer controls its own switch.
+
+Close the popup to continue on Home. Use **Connections** to connect another Linux
 host or prepare this host to receive SSH connections. A central server is optional;
 both hosts must be online and reachable. Preparation installs OpenSSH server, rsync,
 and SHA-256 tools and enables SSH at startup. It preserves SSH configuration and
@@ -56,9 +75,9 @@ its own remote directory. For example:
 | `~/notes` | Home | `/home/user/notes` |
 | `~/projects` | Home | `/home/user/projects` |
 
-Select a server in the sidebar to check several folder links, or select a folder
-to check several server links. Use **Select all** or **Clear selection**, then
-**Sync**. Clicking a folder or server name in the table also toggles its checkbox.
+Check folders and servers on Home, then click **Sync**. Use **Select all** or
+**Clear** above either list to adjust the batch. Manage individual destinations
+with **Open**, then **Edit** or **Unlink** beside a link in the settings popup.
 
 Sync compares SHA-256 hashes for files at the same relative path. Equal content
 stays unchanged. Missing files are copied to all selected participants. Different
@@ -77,7 +96,10 @@ Use the CLI's `codesync run` to run commands or `codesync shell` for interactive
 programs. **Stop** cancels local work but
 cannot undo transferred files or guarantee that a remote process stops.
 
-Leave a link's **Remote directory** empty to default to `~/codesync` on the server.
+Leave a link's **Remote directory** empty, or enter `codesync`, to use
+`~/codesync/<local directory name>` on the server. For example, local `test4`
+syncs to `~/codesync/test4`. An absolute parent such as `/srv/codesync` becomes
+`/srv/codesync/test4`. The actual directory name is used, not its display label.
 The directory is created on the first sync. Use distinct destinations for different
 local folders on the same server.
 
@@ -87,7 +109,7 @@ removing a server or folder also removes its links from the app.
 
 ## Local, public, and Tailscale connections
 
-Server properties includes separate local / primary and public addresses and ports.
+Server settings include separate local / primary and public addresses and ports.
 Choose **Automatic**, **Local only**, or **Remote only**. Automatic tries Tailscale,
 local, then public, checking each against the server's saved SSH identity. An
 unrelated machine at the same private IP is rejected before files are transferred.
@@ -102,7 +124,7 @@ must already work. See [remote access setup](docs/remote-access.md) for requirem
 ## Passwords and setup
 
 Passwords are remembered **only while the app is open**, and never written to the
-profile file. After restarting, use **Edit server / passwords** to enter them again,
+profile file. After restarting, use **Open** on the server to enter them again,
 or use an SSH key and agent. SSH and sudo are separate credentials: the login
 password connects to the server; the sudo password is used only for server setup.
 Regular file transfers run as the SSH user and need writable remote directories.
