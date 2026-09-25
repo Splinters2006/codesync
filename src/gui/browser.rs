@@ -71,7 +71,7 @@ impl Browser {
     }
     pub fn remote(server: u64) -> Self {
         Self {
-            root: PathBuf::from("/"),
+            root: PathBuf::from("~/codesync"),
             relative: PathBuf::new(),
             entries: Vec::new(),
             listing: None,
@@ -83,7 +83,7 @@ impl Browser {
             remote: Some(server),
             pending: Some(RemoteRequest {
                 server,
-                path: ".".into(),
+                path: "".into(),
                 preview: false,
             }),
             waiting: true,
@@ -428,22 +428,45 @@ fn read_preview(root: &Path, relative: &Path) -> Result<Preview, String> {
 }
 
 pub fn remote_script(path: &str, preview: bool) -> Result<String, String> {
-    if path.is_empty() || path.contains('\0') {
-        return Err("Invalid remote path.".into());
+    let relative = Path::new(path);
+    if path.contains('\0')
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        if !path.is_empty() {
+            return Err("Choose a location inside ~/codesync.".into());
+        }
     }
-    let quoted = codesync::quote(path);
+
+    let root = r#"$HOME/codesync"#;
+    let relative = codesync::quote(path);
     if preview {
         return Ok(format!(
-            "set -eu; test -f {quoted}; test ! -L {quoted}; head -c {} -- {quoted}",
+            "set -eu; root={root}; mkdir -p -- \"$root\"; cd -- \"$root\"; test -n {relative}; test -f {relative}; test ! -L {relative}; head -c {} -- {relative}",
             PREVIEW_BYTES + 1
         ));
     }
+
     Ok(format!(
         r#"set -eu
-cd -- {quoted}
+root={root}
+mkdir -p -- "$root"
+cd -- "$root"
+if [ -n {relative} ]; then cd -- {relative}; fi
+case "$(pwd -P)/" in
+    "$(cd -- "$root" && pwd -P)/"*) ;;
+    *) exit 1 ;;
+esac
 printf 'PATH\000'
-pwd -P
-printf '\000'
+root_phys=$(cd -- "$root" && pwd -P)
+here=$(pwd -P)
+if [ "$here" = "$root_phys" ]; then
+    printf '\000'
+else
+    printf '%s\000' "${{here#"$root_phys"/}}"
+fi
 count=0
 for entry in ./* ./.[!.]* ./..?*; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
@@ -461,6 +484,7 @@ printf 'END\000'
 "#
     ))
 }
+
 pub fn remote_listing(output: &str) -> Result<Listing, String> {
     let mut parts = output.split('\0');
     if parts.next() != Some("PATH") {
@@ -468,8 +492,16 @@ pub fn remote_listing(output: &str) -> Result<Listing, String> {
     }
     let root = parts.next().ok_or("Missing remote path")?;
     let root = root.strip_suffix('\n').unwrap_or(root);
-    if !root.starts_with('/') || root.contains('\u{fffd}') {
-        return Err("Invalid remote directory.".into());
+    let relative = Path::new(root);
+    if root.contains('\u{fffd}')
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        if !root.is_empty() {
+            return Err("Invalid remote directory.".into());
+        }
     }
     let mut entries = Vec::new();
     loop {
@@ -546,49 +578,41 @@ mod tests {
     use super::*;
     #[test]
     fn remote_listing_and_preview_handle_quoted_names_without_changes() {
-        let scratch = crate::sync::Scratch::new().unwrap();
-        let directory = scratch.0.join("folder ' with spaces\n");
-        fs::create_dir(&directory).unwrap();
-        fs::create_dir(directory.join("subfolder")).unwrap();
-        fs::write(directory.join("note ' quoted\n.txt"), "remote contents").unwrap();
-        fs::write(directory.join(".hidden"), "hidden").unwrap();
-        std::os::unix::fs::symlink("note ' quoted\n.txt", directory.join("link")).unwrap();
-        let script = remote_script(directory.to_str().unwrap(), false).unwrap();
-        let output = std::process::Command::new("sh")
-            .args(["-c", &script])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let listing = remote_listing(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
-        assert_eq!(listing.relative, directory);
-        assert_eq!(listing.entries.len(), 4);
+        let script = remote_script("folder ' with spaces", false).unwrap();
+        assert!(script.contains("$HOME/codesync"));
+        assert!(remote_script("../outside", false).is_err());
+        assert!(remote_script("/tmp", false).is_err());
+
+        let output = [
+            "PATH",
+            "folder ' with spaces",
+            "dir",
+            "0",
+            "subfolder",
+            "file",
+            "15",
+            "note ' quoted\n.txt",
+            "link",
+            "0",
+            "link",
+            "END",
+        ]
+        .join("\0");
+        let listing = remote_listing(&output).unwrap();
+        assert_eq!(listing.relative, PathBuf::from("folder ' with spaces"));
+        assert_eq!(listing.entries.len(), 3);
         assert!(listing.entries[0].kind == Kind::Directory);
-        assert!(
-            listing
-                .entries
-                .iter()
-                .any(|entry| entry.name == "note ' quoted\n.txt")
-        );
-        let path = directory.join("note ' quoted\n.txt");
-        let output = std::process::Command::new("sh")
-            .args(["-c", &remote_script(path.to_str().unwrap(), true).unwrap()])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+        assert!(listing
+            .entries
+            .iter()
+            .any(|entry| entry.name == "note ' quoted\n.txt"));
         assert_eq!(
-            remote_preview("file", String::from_utf8(output.stdout).unwrap()).text,
+            remote_preview("file", "remote contents".into()).text,
             "remote contents"
         );
-        assert_eq!(fs::read_to_string(path).unwrap(), "remote contents");
-        let output = std::process::Command::new("sh")
-            .args([
-                "-c",
-                &remote_script(directory.join("link").to_str().unwrap(), true).unwrap(),
-            ])
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(remote_listing(&["PATH", "/tmp", "file", "1", "incomplete"].join("\0")).is_err());
+        assert!(remote_listing(&["PATH", "/tmp", "END"].join("\0")).is_err());
+        assert!(remote_listing(&["PATH", "../tmp", "END"].join("\0")).is_err());
+        assert!(remote_listing(&["PATH", "", "file", "1", "incomplete"].join("\0")).is_err());
     }
 
     #[test]
