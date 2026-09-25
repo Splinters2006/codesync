@@ -17,6 +17,14 @@ use std::{
 };
 
 pub enum Event {
+    BrowserListing {
+        server: u64,
+        listing: super::browser::Listing,
+    },
+    BrowserPreview {
+        server: u64,
+        preview: super::browser::Preview,
+    },
     Output(Vec<u8>),
     TrustHost {
         prompt: String,
@@ -39,6 +47,7 @@ pub enum Event {
 }
 #[derive(Clone)]
 pub enum Action {
+    Browse { path: String, preview: bool },
     Test,
     Setup,
     Tailscale,
@@ -233,6 +242,24 @@ fn run_tasks(
             ctx,
         };
         match &task.action {
+            Action::Browse { path, preview } => {
+                let script = super::browser::remote_script(path, *preview)?;
+                let output =
+                    runner.execute_output(ssh(&task.server, &script), None, OutputMode::Capture)?;
+                let event = if *preview {
+                    Event::BrowserPreview {
+                        server: task.server.id,
+                        preview: super::browser::remote_preview(path, output),
+                    }
+                } else {
+                    Event::BrowserListing {
+                        server: task.server.id,
+                        listing: super::browser::remote_listing(&output)?,
+                    }
+                };
+                let _ = events.send(event);
+                ctx.request_repaint();
+            }
             Action::Test => runner.execute(
                 ssh(&task.server, "printf '%s\\n' 'Connected successfully.'"),
                 None,

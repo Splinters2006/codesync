@@ -48,7 +48,6 @@ struct LinkEditor {
     error: Option<String>,
 }
 struct FolderEditor {
-    viewer: browser::Browser,
     id: u64,
     name: String,
     path: String,
@@ -56,6 +55,8 @@ struct FolderEditor {
 }
 struct App {
     data: Data,
+    file_browser: Option<browser::Browser>,
+    browser_title: String,
     connections: bool,
     discovery_settings: bool,
     discovery_networks: Vec<String>,
@@ -141,6 +142,8 @@ impl App {
             discovery_status: "Scan to find SSH hosts on your network.".into(),
             discovery_error: None,
             data,
+            file_browser: None,
+            browser_title: String::new(),
             connections: false,
             host_ssh_status: None,
             host_status_request: None,
@@ -311,6 +314,7 @@ impl App {
     fn server_action(&mut self, id: u64, action: Action, ctx: &egui::Context) {
         if let Some(server) = self.data.servers.iter().find(|s| s.id == id).cloned() {
             let title = match action {
+                Action::Browse { .. } => "Browsing remote files",
                 Action::Setup => "Setting up server",
                 Action::Tailscale => "Setting up Tailscale",
                 _ => "Testing connection",
@@ -331,6 +335,16 @@ impl App {
         if let Some(job) = &self.job {
             for event in job.events.try_iter().take(64) {
                 match event {
+                    jobs::Event::BrowserListing { server, listing } => {
+                        if let Some(browser) = &mut self.file_browser {
+                            browser.receive_listing(server, listing);
+                        }
+                    }
+                    jobs::Event::BrowserPreview { server, preview } => {
+                        if let Some(browser) = &mut self.file_browser {
+                            browser.receive_preview(server, preview);
+                        }
+                    }
                     jobs::Event::Output(bytes) => self.output.append(&bytes),
                     jobs::Event::TrustHost { prompt, response } => {
                         self.trust = Some((prompt, response))
@@ -366,6 +380,9 @@ impl App {
             self.output.append(b"Verified Tailscale connection saved. Automatic mode prefers it for future syncs.\n");
         }
         if let Some(result) = finished {
+            if let Some(browser) = &mut self.file_browser {
+                browser.finish_remote(result.as_ref().err().map(String::as_str));
+            }
             self.logins.clear();
             self.job = None;
             self.host_status_checked = None;
@@ -504,6 +521,60 @@ impl App {
             );
         }
     }
+    fn browse_item(&mut self, item: Selection, ctx: &egui::Context) {
+        match item {
+            Selection::Folder(id) => {
+                if let Some(folder) = self.data.folders.iter().find(|folder| folder.id == id) {
+                    self.browser_title = folder.name.clone();
+                    self.file_browser = Some(browser::Browser::new(folder.path.clone(), ctx));
+                }
+            }
+            Selection::Server(id) => {
+                if let Some(server) = self.data.servers.iter().find(|server| server.id == id) {
+                    self.browser_title = server.name.clone();
+                    self.file_browser = Some(browser::Browser::remote(id));
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+    fn show_file_browser(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("File browser");
+        let (_, dropped) = ui.dnd_drop_zone::<Selection, _>(
+            egui::Frame::new()
+                .fill(Color32::from_gray(245))
+                .stroke(egui::Stroke::new(1.0_f32, Color32::GRAY))
+                .inner_margin(8.0),
+            |ui| {
+                ui.set_min_width((ui.available_width() - 16.0).max(120.0));
+                ui.set_min_height(280.0);
+                if let Some(browser) = &mut self.file_browser {
+                    ui.strong(&self.browser_title);
+                    browser.show(ui, ctx);
+                } else {
+                    ui.label("Drag a folder or server name here to browse its files.");
+                }
+            },
+        );
+        if let Some(item) = dropped {
+            self.browse_item(*item, ctx);
+        }
+        if self.job.is_none()
+            && let Some(request) = self
+                .file_browser
+                .as_mut()
+                .and_then(|browser| browser.take_request())
+        {
+            self.server_action(
+                request.server,
+                Action::Browse {
+                    path: request.path,
+                    preview: request.preview,
+                },
+                ctx,
+            );
+        }
+    }
     fn show_home(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let busy = self.job.is_some();
         self.home_folders
@@ -512,6 +583,7 @@ impl App {
             .retain(|id| self.data.servers.iter().any(|s| s.id == *id));
         ui.heading("Home");
         ui.label("Choose folders and servers to share. Each selected folder syncs with every selected server.");
+        let mut browse = None;
         let mut open_folder = None;
         let mut open_server = None;
         let mut add_server = false;
@@ -534,13 +606,15 @@ impl App {
                         for folder in &self.data.folders {
                             ui.horizontal_wrapped(|ui| {
                                 let mut checked = self.home_folders.contains(&folder.id);
-                                if ui.checkbox(&mut checked, &folder.name).changed() {
+                                if ui.checkbox(&mut checked, "").changed() {
                                     if checked {
                                         self.home_folders.insert(folder.id);
                                     } else {
                                         self.home_folders.remove(&folder.id);
                                     }
                                 }
+                                ui.dnd_drag_source(egui::Id::new(("folder-drag", folder.id)), Selection::Folder(folder.id), |ui| { ui.label(&folder.name); }).response.on_hover_text("Drag into the file browser");
+                                if ui.small_button("Files").clicked() { browse = Some(Selection::Folder(folder.id)); }
                                 if ui.small_button("Open").clicked() { open_folder = Some(folder.id); }
                                 if ui.small_button("Remove").on_hover_text("Remove this folder and its links from Codesync. Files remain in place.").clicked() { remove = Some(Selection::Folder(folder.id)); }
                             });
@@ -552,27 +626,30 @@ impl App {
                 if columns[0].button("Add folder...").clicked() {
                     self.new_folder = true;
                 }
-                columns[1].heading("Servers");
-                columns[1].separator();
+                self.show_file_browser(&mut columns[1], ctx);
+                columns[2].heading("Servers");
+                columns[2].separator();
                 ui_home_select_all(
-                    &mut columns[1],
+                    &mut columns[2],
                     &mut self.home_servers,
                     self.data.servers.iter().map(|s| s.id),
                 );
                 egui::ScrollArea::vertical()
                     .id_salt("home-servers")
                     .max_height(300.0)
-                    .show(&mut columns[1], |ui| {
+                    .show(&mut columns[2], |ui| {
                         for server in &self.data.servers {
                             ui.horizontal_wrapped(|ui| {
                                 let mut checked = self.home_servers.contains(&server.id);
-                                if ui.checkbox(&mut checked, &server.name).changed() {
+                                if ui.checkbox(&mut checked, "").changed() {
                                     if checked {
                                         self.home_servers.insert(server.id);
                                     } else {
                                         self.home_servers.remove(&server.id);
                                     }
                                 }
+                                ui.dnd_drag_source(egui::Id::new(("server-drag", server.id)), Selection::Server(server.id), |ui| { ui.label(&server.name); }).response.on_hover_text("Drag into the file browser");
+                                if ui.small_button("Files").clicked() { browse = Some(Selection::Server(server.id)); }
                                 if ui.small_button("Open").clicked() { open_server = Some(server.id); }
                                 if ui.small_button("Remove").on_hover_text("Remove this server and its links from Codesync. Remote files remain in place.").clicked() { remove = Some(Selection::Server(server.id)); }
                             });
@@ -581,7 +658,7 @@ impl App {
                             ui.label("No servers added");
                         }
                     });
-                if columns[1].button("Add server...").clicked() {
+                if columns[2].button("Add server...").clicked() {
                     add_server = true;
                 }
                 columns[2].heading("Hosts");
@@ -619,6 +696,9 @@ impl App {
 
             });
         });
+        if let Some(item) = browse {
+            self.browse_item(item, ctx);
+        }
         if let Some((host, saved)) = discovered_connection {
             self.edit_server(saved);
             if saved.is_none()
@@ -642,7 +722,6 @@ impl App {
             && let Some(folder) = self.data.folders.iter().find(|folder| folder.id == id)
         {
             self.folder_editor = Some(FolderEditor {
-                viewer: browser::Browser::new(folder.path.clone(), ctx),
                 id,
                 name: folder.name.clone(),
                 path: folder.path.display().to_string(),
@@ -745,7 +824,61 @@ impl App {
             });
         }
     }
+    fn close_focused_popup_on_escape(&mut self, ctx: &egui::Context) {
+        let popups = [
+            (self.link_editor.is_some(), "Folder / server link"),
+            (self.server_editor.is_some(), "Server settings"),
+            (self.folder_editor.is_some(), "Folder settings"),
+            (self.new_folder, "Add local folder"),
+            (self.connections, "Connections"),
+            (self.discovery_settings, "Scan network for SSH hosts"),
+        ];
+        if !popups.iter().any(|(open, _)| *open)
+            && self.trust.is_none()
+            && self.host_password.is_none()
+        {
+            return;
+        }
+        if !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            return;
+        }
+        // Close a dropdown first, without also closing its settings window.
+        if egui::Popup::is_any_open(ctx) {
+            egui::Popup::close_all(ctx);
+            return;
+        }
+        // Escape on authentication dialogs has exactly the same effect as Cancel.
+        if let Some((_, response)) = self.trust.take() {
+            let _ = response.send(false);
+            return;
+        }
+        if let Some(response) = self.host_password.take() {
+            self.host_password_input.clear();
+            let _ = response.send(None);
+            return;
+        }
+        let top = ctx.top_layer_id().map(|layer| layer.id);
+        let focused = popups
+            .iter()
+            .find(|(open, title)| *open && top == Some(egui::Id::new(title)))
+            .or_else(|| popups.iter().find(|(open, _)| *open))
+            .map(|(_, title)| *title);
+        match focused {
+            Some("Folder / server link") => self.link_editor = None,
+            Some("Server settings") => self.server_editor = None,
+            Some("Folder settings") => self.folder_editor = None,
+            Some("Add local folder") => {
+                self.new_folder = false;
+                self.picker = None;
+            }
+            Some("Connections") => self.connections = false,
+            Some("Scan network for SSH hosts") => self.discovery_settings = false,
+            _ => {}
+        }
+        ctx.memory_mut(|memory| memory.stop_text_input());
+    }
     fn show_dialogs(&mut self, ctx: &egui::Context) {
+        self.close_focused_popup_on_escape(ctx);
         if self.discovery_settings {
             let mut open = true;
             let mut start = false;
@@ -782,7 +915,7 @@ impl App {
         if let Some(mut editor) = self.folder_editor.take() {
             let mut open = true;
             let mut save = false;
-            egui::Window::new("Folder settings and files")
+            egui::Window::new("Folder settings")
                 .open(&mut open)
                 .collapsible(false)
                 .default_width(650.0)
@@ -807,7 +940,6 @@ impl App {
                         if ui.button("Save").clicked() {
                             save = true;
                         }
-                        editor.viewer.show(ui, ctx);
                         self.show_link_settings(ui, Selection::Folder(editor.id));
                     });
                 });

@@ -20,17 +20,26 @@ struct Entry {
     kind: Kind,
     size: u64,
 }
-struct Listing {
+pub struct Listing {
     relative: PathBuf,
     entries: Vec<Entry>,
     limited: bool,
 }
-struct Preview {
+pub struct Preview {
     name: String,
     text: String,
     truncated: bool,
 }
+#[derive(Clone)]
+pub struct RemoteRequest {
+    pub server: u64,
+    pub path: String,
+    pub preview: bool,
+}
 pub struct Browser {
+    remote: Option<u64>,
+    pending: Option<RemoteRequest>,
+    waiting: bool,
     root: PathBuf,
     relative: PathBuf,
     entries: Vec<Entry>,
@@ -44,6 +53,9 @@ pub struct Browser {
 impl Browser {
     pub fn new(root: PathBuf, ctx: &egui::Context) -> Self {
         let mut browser = Self {
+            remote: None,
+            pending: None,
+            waiting: false,
             root,
             relative: PathBuf::new(),
             entries: Vec::new(),
@@ -57,7 +69,61 @@ impl Browser {
         browser.load(PathBuf::new(), ctx);
         browser
     }
+    pub fn remote(server: u64) -> Self {
+        Self {
+            root: PathBuf::from("/"),
+            relative: PathBuf::new(),
+            entries: Vec::new(),
+            listing: None,
+            loading_preview: None,
+            preview: None,
+            show_hidden: false,
+            limited: false,
+            error: None,
+            remote: Some(server),
+            pending: Some(RemoteRequest {
+                server,
+                path: ".".into(),
+                preview: false,
+            }),
+            waiting: true,
+        }
+    }
+    pub fn take_request(&mut self) -> Option<RemoteRequest> {
+        self.pending.take()
+    }
+    pub fn receive_listing(&mut self, server: u64, listing: Listing) {
+        if self.remote == Some(server) {
+            self.relative = listing.relative;
+            self.entries = listing.entries;
+            self.limited = listing.limited;
+            self.waiting = false;
+        }
+    }
+    pub fn receive_preview(&mut self, server: u64, preview: Preview) {
+        if self.remote == Some(server) {
+            self.preview = Some(preview);
+            self.waiting = false;
+        }
+    }
+    pub fn finish_remote(&mut self, error: Option<&str>) {
+        if self.remote.is_some() && self.waiting {
+            self.waiting = false;
+            self.error = error.map(str::to_owned);
+        }
+    }
     fn load(&mut self, relative: PathBuf, ctx: &egui::Context) {
+        if let Some(server) = self.remote {
+            self.pending = Some(RemoteRequest {
+                server,
+                path: relative.to_string_lossy().into_owned(),
+                preview: false,
+            });
+            self.waiting = true;
+            self.preview = None;
+            self.error = None;
+            return;
+        }
         let (send, receive) = mpsc::channel();
         let root = self.root.clone();
         let ctx = ctx.clone();
@@ -71,6 +137,17 @@ impl Browser {
         });
     }
     fn preview_file(&mut self, relative: PathBuf, ctx: &egui::Context) {
+        if let Some(server) = self.remote {
+            self.pending = Some(RemoteRequest {
+                server,
+                path: relative.to_string_lossy().into_owned(),
+                preview: true,
+            });
+            self.waiting = true;
+            self.preview = None;
+            self.error = None;
+            return;
+        }
         let (send, receive) = mpsc::channel();
         let root = self.root.clone();
         let ctx = ctx.clone();
@@ -106,17 +183,23 @@ impl Browser {
             }
         }
         ui.separator();
-        ui.strong("Folder contents")
-            .on_hover_text(format!("Viewing saved directory: {}", self.root.display()));
-        ui.label(if self.relative.as_os_str().is_empty() {
-            "/".into()
-        } else {
-            format!("/{}", self.relative.display())
-        });
+        ui.strong("Folder contents");
+        ui.label(
+            if self.remote.is_some() && !self.relative.as_os_str().is_empty() {
+                self.relative.display().to_string()
+            } else if self.relative.as_os_str().is_empty() {
+                "/".into()
+            } else {
+                format!("/{}", self.relative.display())
+            },
+        );
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
-                    self.listing.is_none() && !self.relative.as_os_str().is_empty(),
+                    self.listing.is_none()
+                        && !self.waiting
+                        && self.relative.parent().is_some()
+                        && !self.relative.as_os_str().is_empty(),
                     egui::Button::new("Up"),
                 )
                 .clicked()
@@ -127,14 +210,17 @@ impl Browser {
                 );
             }
             if ui
-                .add_enabled(self.listing.is_none(), egui::Button::new("Refresh files"))
+                .add_enabled(
+                    self.listing.is_none() && !self.waiting,
+                    egui::Button::new("Refresh files"),
+                )
                 .clicked()
             {
                 self.load(self.relative.clone(), ctx);
             }
             ui.checkbox(&mut self.show_hidden, "Show hidden files");
         });
-        if self.listing.is_some() {
+        if self.listing.is_some() || self.waiting {
             ui.label("Loading files...");
         }
         if let Some(error) = &self.error {
@@ -147,7 +233,7 @@ impl Browser {
             .collect();
         ui.label(format!("{} entries", visible.len()));
         if self.limited {
-            ui.label("Showing at most 10,000 entries in this directory.");
+            ui.label("Directory listing truncated; browse a subfolder to narrow the list.");
         }
         let mut selected = None;
         egui::Frame::new()
@@ -195,6 +281,7 @@ impl Browser {
             });
         if let Some((path, kind)) = selected
             && self.listing.is_none()
+            && !self.waiting
         {
             match kind {
                 Kind::Directory => self.load(path, ctx),
@@ -340,9 +427,170 @@ fn read_preview(root: &Path, relative: &Path) -> Result<Preview, String> {
     })
 }
 
+pub fn remote_script(path: &str, preview: bool) -> Result<String, String> {
+    if path.is_empty() || path.contains('\0') {
+        return Err("Invalid remote path.".into());
+    }
+    let quoted = codesync::quote(path);
+    if preview {
+        return Ok(format!(
+            "set -eu; test -f {quoted}; test ! -L {quoted}; head -c {} -- {quoted}",
+            PREVIEW_BYTES + 1
+        ));
+    }
+    Ok(format!(
+        r#"set -eu
+cd -- {quoted}
+printf 'PATH\000'
+pwd -P
+printf '\000'
+count=0
+for entry in ./* ./.[!.]* ./..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    if [ "$count" -ge 5000 ]; then printf 'LIMIT\000'; exit 0; fi
+    count=$((count + 1))
+    size=0
+    if [ -L "$entry" ]; then kind=link
+    elif [ -d "$entry" ]; then kind=dir
+    elif [ -f "$entry" ]; then kind=file; size=$(stat -c %s -- "$entry")
+    else kind=other
+    fi
+    printf '%s\000%s\000%s\000' "$kind" "$size" "${{entry#./}}"
+done
+printf 'END\000'
+"#
+    ))
+}
+pub fn remote_listing(output: &str) -> Result<Listing, String> {
+    let mut parts = output.split('\0');
+    if parts.next() != Some("PATH") {
+        return Err("Cannot read remote directory listing.".into());
+    }
+    let root = parts.next().ok_or("Missing remote path")?;
+    let root = root.strip_suffix('\n').unwrap_or(root);
+    if !root.starts_with('/') || root.contains('\u{fffd}') {
+        return Err("Invalid remote directory.".into());
+    }
+    let mut entries = Vec::new();
+    loop {
+        let kind = match parts.next() {
+            Some("END") => {
+                entries
+                    .sort_by(|a: &Entry, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
+                return Ok(Listing {
+                    relative: root.into(),
+                    entries,
+                    limited: false,
+                });
+            }
+            Some("LIMIT") => {
+                entries
+                    .sort_by(|a: &Entry, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
+                return Ok(Listing {
+                    relative: root.into(),
+                    entries,
+                    limited: true,
+                });
+            }
+            Some("dir") => Kind::Directory,
+            Some("file") => Kind::File,
+            Some("link") => Kind::Link,
+            Some("other") => Kind::Other,
+            _ => return Err("Incomplete remote listing. Refresh to try again.".into()),
+        };
+        let size = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .ok_or("Invalid file size")?;
+        let name = parts.next().ok_or("Missing filename")?;
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\u{fffd}')
+        {
+            return Err("Remote filenames must be valid UTF-8.".into());
+        }
+        entries.push(Entry {
+            name: name.into(),
+            kind,
+            size,
+        });
+    }
+}
+pub fn remote_preview(path: &str, text: String) -> Preview {
+    let mut text = text;
+    let truncated = text.len() as u64 > PREVIEW_BYTES;
+    if truncated {
+        let mut end = PREVIEW_BYTES as usize;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    if text
+        .chars()
+        .any(|c| c == '\u{fffd}' || (c.is_control() && !matches!(c, '\n' | '\r' | '\t')))
+    {
+        text = "Binary or non-UTF-8 file — no text preview available.".into();
+    }
+    Preview {
+        name: path.into(),
+        text,
+        truncated,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_listing_and_preview_handle_quoted_names_without_changes() {
+        let scratch = crate::sync::Scratch::new().unwrap();
+        let directory = scratch.0.join("folder ' with spaces\n");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(directory.join("subfolder")).unwrap();
+        fs::write(directory.join("note ' quoted\n.txt"), "remote contents").unwrap();
+        fs::write(directory.join(".hidden"), "hidden").unwrap();
+        std::os::unix::fs::symlink("note ' quoted\n.txt", directory.join("link")).unwrap();
+        let script = remote_script(directory.to_str().unwrap(), false).unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let listing = remote_listing(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+        assert_eq!(listing.relative, directory);
+        assert_eq!(listing.entries.len(), 4);
+        assert!(listing.entries[0].kind == Kind::Directory);
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.name == "note ' quoted\n.txt")
+        );
+        let path = directory.join("note ' quoted\n.txt");
+        let output = std::process::Command::new("sh")
+            .args(["-c", &remote_script(path.to_str().unwrap(), true).unwrap()])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            remote_preview("file", String::from_utf8(output.stdout).unwrap()).text,
+            "remote contents"
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), "remote contents");
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &remote_script(directory.join("link").to_str().unwrap(), true).unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(remote_listing(&["PATH", "/tmp", "file", "1", "incomplete"].join("\0")).is_err());
+    }
+
     #[test]
     fn lists_folders_first_and_previews_without_modifying_files() {
         let scratch = crate::sync::Scratch::new().unwrap();

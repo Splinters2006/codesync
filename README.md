@@ -79,15 +79,23 @@ once to gain the command.
    are preserved. First-time connections ask you to verify the server fingerprint.
 
 Use **Open** beside a folder or server to open its settings popup.
-Folder settings include its name, local directory, links, and a file viewer.
+Folder settings include its name, local directory, and links. Server settings
+include addresses, credentials, connection tests, setup, and links. For a custom
+destination, choose **Add link** in folder or server settings and enter an absolute
+remote directory. Press **Escape** to close the focused popup.
+
+The **File browser** is in the center of Home. Drag a folder or server name into
+it, or click its **Files** button. Local folders open at their saved directory;
+servers open at the SSH account's home directory. Remote browsing uses the saved
+credentials, Tailscale preference, and SSH fingerprint checks.
 Select a subfolder to browse it or a text file for a read-only preview. The viewer
 has **Up**, **Refresh files**, file sizes, and **Show hidden files** controls. It
-browses the saved local directory, lists folders first, and limits text previews
-to 256 KiB. Binary files and symbolic links are listed but not opened. Server settings
-include addresses, credentials, connection tests, setup, and links. Incoming SSH controls are in the **Hosts** column on Home. For a custom destination, choose **Add link** in
-folder or server settings and enter an absolute remote directory.
+lists folders first and limits text previews to 256 KiB. Binary files and symbolic
+links are listed but not opened. Dropping a server opens its files; it does not
+start a sync.
+
 Home includes **Remove** buttons for folders and servers. They remove the entry
-and its links from Codesync, leaving all files in place. The third **Hosts** column
+and its links from Codesync, leaving all files in place. The **Hosts** section on the right
 shows this computer's **Accept SSH connections** checkbox. Checking it installs
 and enables SSH; unchecking it stops and disables the system SSH service and any
 SSH socket activation. Existing SSH sessions may remain open. The switch reflects
@@ -148,7 +156,7 @@ removing a server or folder also removes its links from the app.
 
 ## Find SSH hosts on your network
 
-In the **Hosts** column, click **Scan network...**, choose a connected IPv4 subnet,
+In the **Hosts** section, click **Scan network...**, choose a connected IPv4 subnet,
 and click **Scan**. The default SSH port is 22; enter another port if needed.
 Reachable services with an SSH greeting appear in the list. Use **Connect** to
 prefill a new connection, or **Settings** for an existing one. Enter credentials
