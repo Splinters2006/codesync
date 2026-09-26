@@ -116,7 +116,7 @@ impl Browser {
         if let Some(server) = self.remote {
             self.pending = Some(RemoteRequest {
                 server,
-                path: relative.to_string_lossy().into_owned(),
+                path: remote_path(&relative),
                 preview: false,
             });
             self.waiting = true;
@@ -140,7 +140,7 @@ impl Browser {
         if let Some(server) = self.remote {
             self.pending = Some(RemoteRequest {
                 server,
-                path: relative.to_string_lossy().into_owned(),
+                path: remote_path(&relative),
                 preview: true,
             });
             self.waiting = true;
@@ -389,11 +389,20 @@ fn read_directory(root: &Path, relative: &Path) -> Result<Listing, String> {
     })
 }
 fn read_preview(root: &Path, relative: &Path) -> Result<Preview, String> {
-    use std::os::unix::fs::OpenOptionsExt;
     let path = checked_path(root, relative)?;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000);
+    } // FILE_FLAG_OPEN_REPARSE_POINT
+    let file = options
         .open(path)
         .map_err(|e| format!("Cannot open file: {e}"))?;
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
@@ -429,15 +438,14 @@ fn read_preview(root: &Path, relative: &Path) -> Result<Preview, String> {
 
 pub fn remote_script(path: &str, preview: bool) -> Result<String, String> {
     let relative = Path::new(path);
-    if path.contains('\0')
-        || relative.is_absolute()
-        || relative
-            .components()
-            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    if !path.is_empty()
+        && (path.contains('\0')
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_))))
     {
-        if !path.is_empty() {
-            return Err("Choose a location inside ~/codesync.".into());
-        }
+        return Err("Choose a location inside ~/codesync.".into());
     }
 
     let root = r#"$HOME/codesync"#;
@@ -491,17 +499,19 @@ pub fn remote_listing(output: &str) -> Result<Listing, String> {
         return Err("Cannot read remote directory listing.".into());
     }
     let root = parts.next().ok_or("Missing remote path")?;
+    if cfg!(windows) {
+        codesync::platform::validate_windows_paths([root])?;
+    }
     let root = root.strip_suffix('\n').unwrap_or(root);
     let relative = Path::new(root);
-    if root.contains('\u{fffd}')
-        || relative.is_absolute()
-        || relative
-            .components()
-            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    if !root.is_empty()
+        && (root.contains('\u{fffd}')
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_))))
     {
-        if !root.is_empty() {
-            return Err("Invalid remote directory.".into());
-        }
+        return Err("Invalid remote directory.".into());
     }
     let mut entries = Vec::new();
     loop {
@@ -543,6 +553,9 @@ pub fn remote_listing(output: &str) -> Result<Listing, String> {
         {
             return Err("Remote filenames must be valid UTF-8.".into());
         }
+        if cfg!(windows) {
+            codesync::platform::validate_windows_paths([name])?;
+        }
         entries.push(Entry {
             name: name.into(),
             kind,
@@ -573,6 +586,15 @@ pub fn remote_preview(path: &str, text: String) -> Preview {
     }
 }
 
+fn remote_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,7 +613,11 @@ mod tests {
             "subfolder",
             "file",
             "15",
-            "note ' quoted\n.txt",
+            if cfg!(windows) {
+                "note ' quoted.txt"
+            } else {
+                "note ' quoted\n.txt"
+            },
             "link",
             "0",
             "link",
@@ -602,10 +628,12 @@ mod tests {
         assert_eq!(listing.relative, PathBuf::from("folder ' with spaces"));
         assert_eq!(listing.entries.len(), 3);
         assert!(listing.entries[0].kind == Kind::Directory);
-        assert!(listing
-            .entries
-            .iter()
-            .any(|entry| entry.name == "note ' quoted\n.txt"));
+        assert!(listing.entries.iter().any(|entry| entry.name
+            == if cfg!(windows) {
+                "note ' quoted.txt"
+            } else {
+                "note ' quoted\n.txt"
+            }));
         assert_eq!(
             remote_preview("file", "remote contents".into()).text,
             "remote contents"
@@ -651,6 +679,7 @@ mod tests {
         let preview = read_preview(&scratch.0, Path::new("large.txt")).unwrap();
         assert!(preview.truncated);
         assert_eq!(preview.text.len(), PREVIEW_BYTES as usize - 1);
+        #[cfg(unix)]
         std::os::unix::fs::symlink("large.txt", scratch.0.join("link")).unwrap();
         assert!(read_preview(&scratch.0, Path::new("link")).is_err());
         assert!(read_directory(&scratch.0, Path::new("../")).is_err());

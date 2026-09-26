@@ -1,0 +1,42 @@
+name: Check
+on: [push, pull_request]
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rsync libxkbcommon-dev libwayland-dev
+      - name: Windows transfer tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://cygwin.com/setup-x86_64.exe -OutFile "$env:RUNNER_TEMP\cygwin-setup.exe"
+          $process = Start-Process "$env:RUNNER_TEMP\cygwin-setup.exe" -ArgumentList '-q -B -R C:\cygwin64 -s https://mirrors.kernel.org/sourceware/cygwin/ -P openssh,rsync,coreutils' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Cygwin installation failed' }
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo check --no-default-features --locked
+      - name: Linux installer and host control checks
+        if: runner.os == 'Linux'
+        run: |
+          python3 tests/install.py
+          python3 tests/host_control.py
+      - name: Windows installer smoke test
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:CARGO_INSTALL_ROOT = Join-Path $env:RUNNER_TEMP 'codesync install'
+          ./install.ps1 -CliOnly
+          if ($LASTEXITCODE -ne 0) { throw 'Installer failed' }
+          ./install.ps1 -PathOnly
+          & "$env:CARGO_INSTALL_ROOT\bin\codesync.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw 'Installed CLI failed' }

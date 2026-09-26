@@ -1,16 +1,17 @@
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::net::{TcpListener as LocalListener, TcpStream as LocalStream};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener as LocalListener, UnixStream as LocalStream};
+#[cfg(unix)]
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
-    os::unix::{
-        fs::DirBuilderExt,
-        net::{UnixListener, UnixStream},
-    },
+    sync::atomic::{AtomicU64, Ordering},
+};
+use std::{
+    io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    },
+    sync::mpsc,
     time::Duration,
 };
 
@@ -33,6 +34,8 @@ impl Credentials {
 struct Request {
     prompt: String,
     kind: String,
+    #[cfg(windows)]
+    token: String,
 }
 #[derive(Serialize, Deserialize)]
 struct Response {
@@ -52,13 +55,17 @@ fn host_confirmation(request: &Request) -> bool {
 // Called only by OpenSSH's askpass hook; no password is placed in argv or env.
 pub fn askpass() -> Result<(), String> {
     let path = std::env::var_os("CODESYNC_AUTH_SOCKET").ok_or("Missing authentication socket")?;
-    let mut stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    let path = path.to_string_lossy().into_owned();
+    let mut stream = LocalStream::connect(path).map_err(|e| e.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(180)))
         .map_err(|e| e.to_string())?;
     let request = Request {
         prompt: std::env::args().nth(1).unwrap_or_default(),
         kind: std::env::var("SSH_ASKPASS_PROMPT").unwrap_or_default(),
+        #[cfg(windows)]
+        token: std::env::var("CODESYNC_AUTH_TOKEN").map_err(|e| e.to_string())?,
     };
     serde_json::to_writer(&mut stream, &request).map_err(|e| e.to_string())?;
     stream.write_all(b"\n").map_err(|e| e.to_string())?;
@@ -77,12 +84,16 @@ pub fn askpass() -> Result<(), String> {
 }
 
 pub struct Bridge {
+    #[cfg(unix)]
     dir: PathBuf,
+    #[cfg(windows)]
+    pub token: String,
     pub socket: PathBuf,
-    listener: UnixListener,
-    pending: Option<(UnixStream, mpsc::Receiver<bool>)>,
+    listener: LocalListener,
+    pending: Option<(LocalStream, mpsc::Receiver<bool>)>,
 }
 impl Bridge {
+    #[cfg(unix)]
     pub fn new() -> Result<Self, String> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -90,12 +101,10 @@ impl Bridge {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
+        codesync::platform::private_directory(&dir, false)
             .map_err(|e| format!("Cannot create private authentication directory: {e}"))?;
         let socket = dir.join("socket");
-        let listener = match UnixListener::bind(&socket) {
+        let listener = match LocalListener::bind(&socket) {
             Ok(listener) => listener,
             Err(e) => {
                 let _ = fs::remove_dir(&dir);
@@ -105,6 +114,26 @@ impl Bridge {
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         Ok(Self {
             dir,
+            socket,
+            listener,
+            pending: None,
+        })
+    }
+    #[cfg(windows)]
+    pub fn new() -> Result<Self, String> {
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random).map_err(|e| e.to_string())?;
+        let token = random.iter().map(|b| format!("{b:02x}")).collect();
+        let listener = LocalListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let socket = PathBuf::from(
+            listener
+                .local_addr()
+                .map_err(|e| e.to_string())?
+                .to_string(),
+        );
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        Ok(Self {
+            token,
             socket,
             listener,
             pending: None,
@@ -133,15 +162,21 @@ impl Bridge {
         let Ok((stream, _)) = self.listener.accept() else {
             return;
         };
+        let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        if reader.read_line(&mut line).is_err() {
+        if (&mut reader).take(65_536).read_line(&mut line).is_err() || !line.ends_with('\n') {
             return;
         }
         let Ok(request) = serde_json::from_str::<Request>(&line) else {
             return;
         };
+        #[cfg(windows)]
+        if request.token != self.token {
+            return;
+        }
         let stream = reader.into_inner();
         if host_confirmation(&request) {
             let (sender, response) = mpsc::channel();
@@ -167,7 +202,7 @@ impl Bridge {
         }
     }
 }
-fn reply(mut stream: UnixStream, answer: Option<String>) {
+fn reply(mut stream: LocalStream, answer: Option<String>) {
     let _ = serde_json::to_writer(&mut stream, &Response { answer });
     let _ = stream.write_all(b"\n");
 }
@@ -176,11 +211,14 @@ impl Drop for Bridge {
         if let Some((stream, _)) = self.pending.take() {
             reply(stream, None);
         }
-        let _ = fs::remove_file(&self.socket);
-        let _ = fs::remove_dir(&self.dir);
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(&self.socket);
+            let _ = fs::remove_dir(&self.dir);
+        }
     }
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -197,7 +235,7 @@ mod tests {
             login: "secret-test".into(),
             ..Default::default()
         };
-        let mut socket = UnixStream::connect(&bridge.socket).unwrap();
+        let mut socket = LocalStream::connect(&bridge.socket).unwrap();
         writeln!(
             socket,
             "{{\"prompt\":\"user@host's password: \",\"kind\":\"\"}}"
@@ -231,7 +269,7 @@ mod tests {
                 true,
             ),
         ] {
-            let mut socket = UnixStream::connect(&bridge.socket).unwrap();
+            let mut socket = LocalStream::connect(&bridge.socket).unwrap();
             let request = Request {
                 prompt: format!(
                     "The authenticity of host 'codesync-server-test' can't be established.\nED25519 key fingerprint is SHA256:test.\n{question}"
@@ -274,5 +312,71 @@ mod tests {
                 kind: kind.into()
             }));
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    #[test]
+    fn loopback_auth_requires_token_and_explicit_host_trust() {
+        let mut bridge = Bridge::new().unwrap();
+        let (events, receiver) = mpsc::channel();
+        let ctx = eframe::egui::Context::default();
+        let credentials = Credentials {
+            login: "test-secret".into(),
+            ..Default::default()
+        };
+        for valid in [false, true] {
+            let mut stream = LocalStream::connect(bridge.socket.to_str().unwrap()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let request = Request {
+                prompt: "user@host's password: ".into(),
+                kind: String::new(),
+                token: if valid {
+                    bridge.token.clone()
+                } else {
+                    "wrong-token".into()
+                },
+            };
+            serde_json::to_writer(&mut stream, &request).unwrap();
+            writeln!(stream).unwrap();
+            bridge.poll(&credentials, &events, &ctx);
+            let mut line = String::new();
+            let result = BufReader::new(stream).read_line(&mut line);
+            if valid {
+                assert_eq!(
+                    serde_json::from_str::<Response>(&line)
+                        .unwrap()
+                        .answer
+                        .as_deref(),
+                    Some("test-secret")
+                );
+            } else {
+                assert!(result.is_err() || line.is_empty());
+            }
+        }
+        let mut stream = LocalStream::connect(bridge.socket.to_str().unwrap()).unwrap();
+        let request = Request { prompt: "ED25519 key fingerprint is SHA256:test.\nAre you sure you want to continue connecting (yes/no/[fingerprint])?".into(), kind: String::new(), token: bridge.token.clone() };
+        serde_json::to_writer(&mut stream, &request).unwrap();
+        writeln!(stream).unwrap();
+        bridge.poll(&credentials, &events, &ctx);
+        let super::super::jobs::Event::TrustHost { response, .. } =
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("Expected explicit trust prompt");
+        };
+        response.send(false).unwrap();
+        bridge.poll(&credentials, &events, &ctx);
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        assert!(
+            serde_json::from_str::<Response>(&line)
+                .unwrap()
+                .answer
+                .is_none()
+        );
     }
 }

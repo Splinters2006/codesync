@@ -287,6 +287,11 @@ impl Data {
     }
 }
 fn directory() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .ok_or("Cannot locate AppData.")?;
+    #[cfg(not(windows))]
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))

@@ -1,13 +1,23 @@
 # Codesync
 
 Sync code and notes between local folders and your own servers. Includes a Rust
-CLI and a native Linux desktop app with a classic white-and-gray interface.
+CLI and a native Linux/Windows desktop app with a classic white-and-gray interface.
 
 ## Install
 
-The host needs Rust/Cargo, OpenSSH, rsync, and `sha256sum`. The desktop app needs a Wayland or
-X11 desktop with OpenGL. Zenity is optional for the folder picker; you can also
-enter a path manually. Native Windows support is not implemented.
+Linux hosts need Rust/Cargo, OpenSSH, rsync, and `sha256sum`. The Linux desktop app
+needs Wayland or X11 with OpenGL. Zenity is optional for its folder picker.
+Windows hosts run the native app and CLI with Cygwin transfer tools; see
+[Windows installation](docs/windows.md). Servers remain Linux-only.
+
+On Windows, after installing the prerequisites, run from PowerShell:
+
+```powershell
+.\install.ps1
+codesync gui
+```
+
+Use `-CliOnly` for the CLI or `-PathOnly` to repair PATH. On Linux:
 
 From this repository:
 
@@ -15,7 +25,7 @@ From this repository:
 ./install.sh
 ```
 
-On every machine, the installer runs Cargo and configures PATH for that user
+On Linux, the installer runs Cargo and configures PATH for that user
 in Bash, Zsh, or Fish. If an existing `~/.local/bin` or `~/bin` is already on PATH,
 it adds launchers there so the command works immediately. Otherwise, open a new
 terminal after installation and run `codesync gui` from any directory. The
@@ -96,7 +106,7 @@ start a sync.
 
 Home includes **Remove** buttons for folders and servers. They remove the entry
 and its links from Codesync, leaving all files in place. The **Hosts** section on the right
-shows this computer's **Accept SSH connections** checkbox. Checking it installs
+shows this computer's **Accept SSH connections** checkbox on Linux. Checking it installs
 and enables SSH; unchecking it stops and disables the system SSH service and any
 SSH socket activation. Existing SSH sessions may remain open. The switch reflects
 actual service status and refreshes periodically. Enabling SSH requires
@@ -197,7 +207,7 @@ password connects to the server; the sudo password is used only for server setup
 Regular file transfers run as the SSH user and need writable remote directories.
 
 There is no generic terminal reply field. OpenSSH gets the login password through
-a private local authentication socket. The fixed setup command receives the sudo
+a private Unix socket on Linux, or a token-authenticated loopback connection on Windows. The fixed setup command receives the sudo
 password through its SSH input stream. Passwords are not passed in command-line
 arguments or environment variables. A new host key requires a dedicated fingerprint
 confirmation; changed keys are not automatically trusted. SSH keys requiring a
@@ -213,7 +223,7 @@ separately. The GUI does not need util-linux `script` anymore.
 
 Servers, folders, and links are stored in
 `$XDG_CONFIG_HOME/codesync/profiles.json` (normally
-`~/.config/codesync/profiles.json`). Credentials are kept separately in memory.
+`~/.config/codesync/profiles.json`), or `%APPDATA%\codesync\profiles.json` on Windows. Credentials are kept separately in memory.
 
 The previous `folders.json` list is imported and saved when there is no new profile file.
 Adding a folder with a `.codesync` file imports its existing server destination.
@@ -249,7 +259,7 @@ modification time by default. Keep Git history or backups.
 Excluded at any depth: `.git`, `target`, `node_modules`, `.codesync`, `.env`,
 `.env.*`, `*.pem`, `*.key`. GUI two-way sync accepts regular files and directories;
 symbolic links and special files stop the operation before conflict renaming.
-CLI transfers still support symlinks. Dry runs are CLI-only.
+Linux CLI transfers still support symlinks. Windows transfers require regular files and directories. Dry runs are CLI-only.
 
 For access from class or another network, use a reachable public IPv4/IPv6 address,
 a hostname, or a private VPN address. See [remote access setup](docs/remote-access.md)
@@ -264,4 +274,4 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Authentication tests use local Unix sockets; restricted sandboxes must allow those.
+Authentication tests use local sockets; restricted sandboxes must allow those. CI checks Linux and Windows builds, tests, and installers.

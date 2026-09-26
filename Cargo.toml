@@ -6,7 +6,7 @@ default-run = "codesync"
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:serde", "dep:serde_json", "dep:libc"]
+gui = ["dep:eframe", "dep:serde", "dep:serde_json", "dep:libc", "dep:getrandom"]
 
 [[bin]]
 name = "codesync-gui"
@@ -18,3 +18,5 @@ eframe = { version = "=0.33.3", optional = true, default-features = false, featu
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 libc = { version = "0.2", optional = true }
+
+getrandom = { version = "0.3", optional = true }

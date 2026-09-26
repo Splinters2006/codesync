@@ -4,6 +4,12 @@ use std::{
     process::Command,
 };
 
+const INSTALLER: &str = if cfg!(windows) {
+    "install.ps1"
+} else {
+    "install.sh"
+};
+
 const USAGE: &str = "Usage: codesync update [--repo /path/to/codesync]";
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -47,7 +53,7 @@ fn validate_checkout(source: &Path) -> Result<PathBuf, String> {
         .lines()
         .any(|line| line.trim() == "name = \"codesync\"")
         || !repo.join("src/lib.rs").is_file()
-        || !repo.join("install.sh").is_file()
+        || !repo.join(INSTALLER).is_file()
     {
         return Err("This does not look like the Codesync source repository.".into());
     }
@@ -91,25 +97,57 @@ fn perform(source: &Path, install_root: Option<&Path>, cli_only: bool) -> Result
     }
     validate_checkout(&repo)?;
     println!("Installing the updated Codesync...");
-    let mut install = Command::new("sh");
-    install.arg(repo.join("install.sh")).current_dir(&repo);
+    #[cfg(not(windows))]
+    let mut install = {
+        let mut command = Command::new("sh");
+        command.arg(repo.join(INSTALLER));
+        command
+    };
+    #[cfg(windows)]
+    let mut install = {
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(repo.join(INSTALLER))
+            .arg("-WaitForProcess")
+            .arg(std::process::id().to_string());
+        command
+    };
+    install.current_dir(&repo);
     if cli_only {
-        install.arg("--cli-only");
+        install.arg(if cfg!(windows) {
+            "-CliOnly"
+        } else {
+            "--cli-only"
+        });
     }
     if let Some(root) = install_root {
         install.env("CARGO_INSTALL_ROOT", root);
     }
-    let status = install
-        .status()
-        .map_err(|e| format!("Cannot start installer: {e}"))?;
-    if !status.success() {
-        return Err("The repository was updated, but installation failed. Fix the installer error, then run codesync update again.".into());
+    #[cfg(windows)]
+    {
+        install
+            .spawn()
+            .map_err(|e| format!("Cannot start installer: {e}"))?;
+        println!(
+            "The installer will continue when this command exits. Close the GUI before updating; watch the installer output for the result."
+        );
+        Ok(())
     }
-    println!("Codesync updated. Close and reopen the GUI to use the new version.");
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        let status = install
+            .status()
+            .map_err(|e| format!("Cannot start installer: {e}"))?;
+        if !status.success() {
+            return Err("The repository was updated, but installation failed. Fix the installer error, then run codesync update again.".into());
+        }
+        println!("Codesync updated. Close and reopen the GUI to use the new version.");
+        Ok(())
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};

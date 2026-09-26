@@ -38,3 +38,7 @@ ssh -o ControlPath=~/.ssh/codesync-%C -O exit user@192.168.0.6
 
 SSH keys and an SSH agent can also avoid server password prompts after the shared
 connection expires. Codesync uses your normal SSH configuration and agent.
+
+On Windows, Codesync uses Cygwin OpenSSH and disables connection multiplexing.
+The GUI's dedicated known-hosts file is under `%USERPROFILE%\.ssh`; SSH keys and
+agents follow Cygwin's configuration. See [Windows hosts](windows.md).

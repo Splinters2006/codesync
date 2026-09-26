@@ -2,9 +2,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -18,7 +16,7 @@ impl Scratch {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            match fs::DirBuilder::new().mode(0o700).create(&path) {
+            match codesync::platform::private_directory(&path, false) {
                 Ok(()) => return Ok(Self(path)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.to_string()),
@@ -41,9 +39,13 @@ pub fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 pub fn hash(path: &Path) -> Result<String, String> {
-    let out = Command::new("sha256sum")
+    let out = codesync::platform::command("sha256sum")
         .arg("--")
-        .arg(path)
+        .arg(if cfg!(windows) {
+            std::ffi::OsString::from(codesync::platform::local_path(path))
+        } else {
+            path.as_os_str().to_owned()
+        })
         .output()
         .map_err(|e| format!("SHA-256 requires sha256sum: {e}"))?;
     if !out.status.success() {
@@ -221,6 +223,10 @@ pub fn local_rename(root: &Path, rename: &Rename) -> Result<(), String> {
     if hash(&from)? != rename.hash {
         return Err("A file changed during sync. Retry after edits finish.".into());
     }
+    preserve_rename(&from, &to)
+}
+#[cfg(unix)]
+fn preserve_rename(from: &Path, to: &Path) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     let from = std::ffi::CString::new(from.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
     let to = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
@@ -240,6 +246,14 @@ pub fn local_rename(root: &Path, rename: &Rename) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn preserve_rename(from: &Path, to: &Path) -> Result<(), String> {
+    // Creating a hard link fails if the destination exists. Never replace it.
+    fs::hard_link(from, to).map_err(|e| format!("Cannot preserve conflict: {e}"))?;
+    fs::remove_file(from)
+        .map_err(|e| format!("Conflict preserved but original could not be removed: {e}"))
 }
 
 #[cfg(test)]
@@ -280,10 +294,10 @@ mod tests {
             local_rename(&roots[rename.participant], rename).unwrap();
         }
         for root in &roots {
-            let status = Command::new("rsync")
+            let status = codesync::platform::command("rsync")
                 .args(["-a", "--ignore-existing", "--"])
-                .arg(format!("{}/", merged.display()))
-                .arg(root)
+                .arg(format!("{}/", codesync::platform::local_path(&merged)))
+                .arg(codesync::platform::local_path(root))
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -298,6 +312,7 @@ mod tests {
     #[test]
     fn refuses_changed_files_collisions_and_symlinks() {
         let scratch = Scratch::new().unwrap();
+        #[cfg(unix)]
         let cancel = AtomicBool::new(false);
         fs::write(scratch.0.join("file"), "original").unwrap();
         let rename = Rename {
@@ -319,7 +334,9 @@ mod tests {
             fs::read_to_string(scratch.0.join("Host_file")).unwrap(),
             "keep"
         );
+        #[cfg(unix)]
         std::os::unix::fs::symlink("file", scratch.0.join("link")).unwrap();
+        #[cfg(unix)]
         assert!(scan(&scratch.0, &cancel).is_err());
         assert!(scan(&scratch.0, &AtomicBool::new(true)).is_err());
         let mut file = Tree::default();

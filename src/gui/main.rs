@@ -220,8 +220,8 @@ impl App {
     }
     fn add_folder(&mut self) {
         let path = if let Some(rest) = self.folder_path.trim().strip_prefix("~/") {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(rest))
+            codesync::platform::home()
+                .map(|h| h.join(rest))
                 .unwrap_or_else(|| self.folder_path.trim().into())
         } else {
             self.folder_path.trim().into()
@@ -252,12 +252,23 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = std::process::Command::new("zenity")
-                .args([
+            #[cfg(not(windows))]
+            let mut command = {
+                let mut command = std::process::Command::new("zenity");
+                command.args([
                     "--file-selection",
                     "--directory",
                     "--title=Choose local folder",
-                ])
+                ]);
+                command
+            };
+            #[cfg(windows)]
+            let mut command = {
+                let mut command = std::process::Command::new("powershell.exe");
+                command.args(["-NoProfile", "-STA", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); Add-Type -AssemblyName System.Windows.Forms; $picker = New-Object System.Windows.Forms.FolderBrowserDialog; if ($picker.ShowDialog() -eq 'OK') { [Console]::Write($picker.SelectedPath) }; $picker.Dispose()"]);
+                command
+            };
+            let result = command
                 .output()
                 .map_err(|e| format!("Folder picker unavailable ({e}). Enter the path manually."))
                 .map(|out| {
@@ -349,6 +360,7 @@ impl App {
                     jobs::Event::TrustHost { prompt, response } => {
                         self.trust = Some((prompt, response))
                     }
+                    #[cfg(unix)]
                     jobs::Event::HostPassword { response, purpose } => {
                         self.host_password_purpose = purpose;
                         self.host_password_input.clear();
@@ -422,6 +434,9 @@ impl App {
             .collect()
     }
     fn refresh_host_status(&mut self, ctx: &egui::Context) {
+        if cfg!(windows) {
+            return;
+        }
         if self.host_status_request.is_some() {
             return;
         }
@@ -664,6 +679,7 @@ impl App {
                 columns[2].heading("Hosts");
                 columns[2].separator();
                 columns[2].strong("This host");
+                if cfg!(windows) { columns[2].label("Windows client — connects to Linux servers."); } else {
                 let known = matches!(self.host_ssh_status, Some(Ok(_)));
                 let mut enabled = matches!(self.host_ssh_status, Some(Ok(true)));
                 if columns[2].add_enabled(known && self.host_status_request.is_none(), egui::Checkbox::new(&mut enabled, "Accept SSH connections")).changed() { host_enabled = Some(enabled); }
@@ -676,6 +692,7 @@ impl App {
                 columns[2].label("Controls this computer's system SSH service and startup setting. Other hosts use their own switch.");
                 columns[2].label("Disabling stops new SSH connections; existing sessions may remain open.");
                 if columns[2].button("Refresh status").clicked() { self.refresh_host_status(ctx); }
+                }
                 columns[2].separator();
                 columns[2].strong("Network SSH hosts");
                 if columns[2].add_enabled(self.discovery_scan.is_none(), egui::Button::new("Scan network...")).clicked() { self.discovery_networks = discovery::local_networks(); self.discovery_settings = true; }
@@ -928,7 +945,11 @@ impl App {
                             ui,
                             "Local directory",
                             &mut editor.path,
-                            "/home/user/notes",
+                            if cfg!(windows) {
+                                r"C:\Users\you\notes"
+                            } else {
+                                "/home/user/notes"
+                            },
                             false,
                         );
                         ui.label(
@@ -945,10 +966,7 @@ impl App {
                 });
             if save {
                 let path = if let Some(rest) = editor.path.trim().strip_prefix("~/") {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .unwrap_or_default()
-                        .join(rest)
+                    codesync::platform::home().unwrap_or_default().join(rest)
                 } else {
                     PathBuf::from(editor.path.trim())
                 };
@@ -994,13 +1012,14 @@ impl App {
             let mut connect = false;
             let mut prepare = false;
             egui::Window::new("Connections").open(&mut open).collapsible(false).resizable(false).default_width(460.0).show(ctx, |ui| {
-                ui.label("Connect Linux hosts directly using SSH. A separate file server is optional.");
+                ui.label("Connect to Linux servers using SSH.");
+                if cfg!(windows) { ui.label("Windows hosts can initiate connections. Receiving connections is supported on Linux only."); }
                 ui.label("Both hosts must be online and reachable over your local network, Tailscale, or a configured public address.");
                 ui.separator();
                 ui.add_enabled_ui(self.job.is_none(), |ui| {
                     if ui.button("Connect another host...").clicked() { connect = true; }
                     ui.label("Enter its address and SSH account. Verify its fingerprint before syncing.");
-                    if ui.button("Prepare this host to receive connections").clicked() { prepare = true; }
+                    if ui.add_enabled(!cfg!(windows), egui::Button::new("Prepare this host to receive connections")).clicked() { prepare = true; }
                     ui.label("Installs OpenSSH server, rsync, and SHA-256 tools, enables SSH at startup, and grants this account permission to stop SSH without a password. SSH grants access with that account's permissions, beyond the folders selected in Codesync. Existing SSH settings and firewall rules are preserved.");
                 });
                 ui.label("On the other host, add this host using its reachable address, SSH port, and account. Files sync when you click Sync; no pairing code or background sync is required.");
@@ -1112,7 +1131,11 @@ impl App {
                         ui,
                         "Local directory",
                         &mut self.folder_path,
-                        "/home/user/notes",
+                        if cfg!(windows) {
+                            r"C:\Users\you\notes"
+                        } else {
+                            "/home/user/notes"
+                        },
                         false,
                     );
                     ui.horizontal(|ui| {

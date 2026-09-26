@@ -2,9 +2,10 @@ use super::{
     auth::{Bridge, Credentials},
     store::{ConnectionMode, Server},
 };
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     io::{Read, Write},
-    os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -34,6 +35,7 @@ pub enum Event {
         label: String,
         url: String,
     },
+    #[cfg(unix)]
     HostPassword {
         purpose: String,
         response: Sender<Option<String>>,
@@ -97,6 +99,7 @@ impl Drop for Job {
     }
 }
 
+#[cfg(unix)]
 pub fn host_ssh_status() -> Result<bool, String> {
     let output = Command::new("sh")
         .args([
@@ -118,6 +121,10 @@ pub fn host_ssh_status() -> Result<bool, String> {
         "disabled" => Ok(false),
         _ => Err("Unexpected SSH service status.".into()),
     }
+}
+#[cfg(windows)]
+pub fn host_ssh_status() -> Result<bool, String> {
+    Err("Windows hosts connect to Linux servers; incoming SSH setup is Linux-only.".into())
 }
 fn ssh_args(server: &Server) -> Vec<String> {
     let mut args: Vec<String> = [
@@ -158,10 +165,30 @@ fn ssh_args(server: &Server) -> Vec<String> {
         "-o".into(),
         "CheckHostIP=no".into(),
     ]);
+    if cfg!(windows) {
+        if let Some(home) = codesync::platform::home() {
+            for arg in &mut args {
+                if arg.starts_with("UserKnownHostsFile=") {
+                    *arg = format!(
+                        "UserKnownHostsFile=\"{}\"",
+                        codesync::platform::local_path(&home.join(".ssh/codesync_known_hosts"))
+                    );
+                }
+            }
+        }
+        for arg in &mut args {
+            if arg == "ControlMaster=auto" {
+                *arg = "ControlMaster=no".into();
+            }
+            if arg.starts_with("ControlPath=") {
+                *arg = "ControlPath=none".into();
+            }
+        }
+    }
     args
 }
 fn ssh(server: &Server, script: &str) -> Command {
-    let mut command = Command::new("ssh");
+    let mut command = codesync::platform::command("ssh");
     command
         .args(ssh_args(server))
         .arg(server.destination())
@@ -169,7 +196,7 @@ fn ssh(server: &Server, script: &str) -> Command {
     command
 }
 fn sync_command(task: &Task, pull: bool, dry: bool) -> Command {
-    let mut cmd = Command::new("rsync");
+    let mut cmd = codesync::platform::command("rsync");
     let transport = std::iter::once("ssh".to_owned())
         .chain(ssh_args(&task.server))
         .map(|s| codesync::quote(&s))
@@ -184,6 +211,7 @@ fn sync_command(task: &Task, pull: bool, dry: bool) -> Command {
         cmd.arg("--dry-run");
     }
     let remote = codesync::rsync_destination(&task.server.destination(), &task.remote);
+    codesync::platform::rsync_options(&mut cmd);
     cmd.arg("--");
     if pull {
         cmd.arg(remote).arg("./");
@@ -222,7 +250,7 @@ fn run_tasks(
                 runner.disable_host()?;
             } else {
                 runner.setup_host(
-                    &host_setup_script(unsafe { libc::getuid() }),
+                    &local_host_setup_script(),
                     "incoming SSH connections",
                     OutputMode::Live,
                 )?;
@@ -288,7 +316,7 @@ fn copy_command(
     destination: &std::path::Path,
     missing_only: bool,
 ) -> Command {
-    let mut cmd = Command::new("rsync");
+    let mut cmd = codesync::platform::command("rsync");
     cmd.args(["-a", "--itemize-changes", "--omit-dir-times"]);
     for pattern in codesync::EXCLUDES {
         cmd.arg(format!("--exclude={pattern}"));
@@ -296,9 +324,10 @@ fn copy_command(
     if missing_only {
         cmd.arg("--ignore-existing");
     }
+    codesync::platform::rsync_options(&mut cmd);
     cmd.arg("--")
-        .arg(format!("{}/", source.display()))
-        .arg(destination);
+        .arg(format!("{}/", codesync::platform::local_path(source)))
+        .arg(codesync::platform::local_path(destination));
     cmd
 }
 fn verify_command(
@@ -306,7 +335,7 @@ fn verify_command(
     destination: &std::ffi::OsStr,
     server: Option<&Server>,
 ) -> Command {
-    let mut cmd = Command::new("rsync");
+    let mut cmd = codesync::platform::command("rsync");
     cmd.args(["-rcn", "--out-format=%n", "--protect-args"]);
     for pattern in codesync::EXCLUDES {
         cmd.arg(format!("--exclude={pattern}"));
@@ -319,15 +348,26 @@ fn verify_command(
             .join(" ");
         cmd.arg("-e").arg(transport);
     }
+    codesync::platform::rsync_options(&mut cmd);
     cmd.arg("--")
-        .arg(format!("{}/", source.display()))
-        .arg(destination);
+        .arg(format!("{}/", codesync::platform::local_path(source)))
+        .arg(if server.is_some() {
+            destination.to_string_lossy().into_owned()
+        } else {
+            codesync::platform::local_path(std::path::Path::new(destination))
+        });
     cmd
 }
 fn remote_rename_script(root: &str, rename: &super::sync::Rename) -> Result<String, String> {
     let path = |p: &std::path::Path| {
         p.to_str()
-            .map(codesync::quote)
+            .map(|s| {
+                codesync::quote(&if cfg!(windows) {
+                    s.replace('\\', "/")
+                } else {
+                    s.into()
+                })
+            })
             .ok_or_else(|| "Remote filenames must be valid UTF-8 for conflict renaming.".to_owned())
     };
     let from = path(&rename.from)?;
@@ -371,8 +411,15 @@ fn sync_groups(
         let _ = events.send(Event::Output(
             b"Reading copies and comparing SHA-256 hashes...\n".to_vec(),
         ));
+        if cfg!(windows) {
+            let mut inspect = codesync::platform::command("sh");
+            inspect.args(["-c", &codesync::platform::windows_manifest_script(".")]);
+            let manifest = runner.execute_output(inspect, None, OutputMode::Capture)?;
+            codesync::platform::validate_windows_manifest(&manifest)?;
+        }
         runner.execute(copy_command(&local, &snapshots[0], false), None)?;
-        let host_name = std::fs::read_to_string("/etc/hostname")
+        let host_name = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::fs::read_to_string("/etc/hostname"))
             .unwrap_or_else(|_| "Host".into())
             .trim()
             .to_owned();
@@ -391,6 +438,17 @@ fn sync_groups(
                 ctx,
             };
             runner.execute(ssh(&task.server, &format!("command -v sha256sum >/dev/null || {{ echo 'Install sha256sum on this host before syncing.' >&2; exit 1; }}; mkdir -p -- {}", codesync::quote(&task.remote))), None)?;
+            if cfg!(windows) {
+                let manifest = runner.execute_output(
+                    ssh(
+                        &task.server,
+                        &codesync::platform::windows_manifest_script(&task.remote),
+                    ),
+                    None,
+                    OutputMode::Capture,
+                )?;
+                codesync::platform::validate_windows_manifest(&manifest)?;
+            }
             let directory = scratch.0.join(format!("remote-{index}"));
             std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
             let mut snapshot_task = task.clone();
@@ -411,6 +469,16 @@ fn sync_groups(
             .map(|path| sync::scan(path, cancelled))
             .collect::<Result<Vec<_>, _>>()?;
         let plan = sync::plan(&trees, &names)?;
+        if cfg!(windows) {
+            let paths: Vec<_> = trees
+                .iter()
+                .flat_map(|tree| tree.files.keys().chain(tree.dirs.iter()))
+                .chain(plan.files.keys())
+                .chain(plan.dirs.iter())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .collect();
+            codesync::platform::validate_windows_paths(paths.iter().map(String::as_str))?;
+        }
         let merged = scratch.0.join("merged");
         sync::materialize(&plan, &snapshots, &merged, cancelled)?;
         let _ = events.send(Event::Output(
@@ -460,7 +528,7 @@ fn sync_groups(
             let mut cmd = sync_command(&source, false, false);
             // Insert before -- and positional arguments.
             let args: Vec<_> = cmd.get_args().map(|arg| arg.to_os_string()).collect();
-            cmd = Command::new("rsync");
+            cmd = codesync::platform::command("rsync");
             cmd.arg("--ignore-existing")
                 .arg("--omit-dir-times")
                 .args(args)
@@ -547,7 +615,9 @@ impl Runner<'_> {
             .current_dir(&self.task.local)
             .env(
                 "SSH_ASKPASS",
-                std::env::current_exe().map_err(|e| e.to_string())?,
+                codesync::platform::local_path(
+                    &std::env::current_exe().map_err(|e| e.to_string())?,
+                ),
             )
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env("CODESYNC_ASKPASS", "1")
@@ -561,8 +631,11 @@ impl Runner<'_> {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(windows)]
+        command.env("CODESYNC_AUTH_TOKEN", &self.bridge.token);
         let mut child = command.spawn().map_err(|e| {
             format!(
                 "Cannot start {}: {e}",
@@ -625,9 +698,7 @@ impl Runner<'_> {
         let mut stopping = None;
         let status = loop {
             if self.cancelled.load(Ordering::Relaxed) && stopping.is_none() {
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGTERM);
-                }
+                stop_child(&mut child, false);
                 stopping = Some(Instant::now());
             }
             self.bridge
@@ -636,9 +707,7 @@ impl Runner<'_> {
                 break status;
             }
             if stopping.is_some_and(|time| time.elapsed() > Duration::from_secs(2)) {
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
-                }
+                stop_child(&mut child, true);
             }
             thread::sleep(Duration::from_millis(30));
         };
@@ -703,6 +772,7 @@ fn failure_reason(stderr: &str) -> &'static str {
     }
 }
 
+#[cfg(unix)]
 fn wait_for_host_password(
     receiver: Receiver<Option<String>>,
     cancelled: &AtomicBool,
@@ -725,8 +795,12 @@ fn wait_for_host_password(
     }
 }
 fn available(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            dir.join(format!("{program}{}", std::env::consts::EXE_SUFFIX))
+                .is_file()
+        })
+    })
 }
 fn tailscale_running(output: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(output)
@@ -758,23 +832,18 @@ fn login_url(line: &str) -> Option<String> {
     })
 }
 fn identity_known(server: &Server) -> Result<bool, String> {
-    use std::os::unix::fs::DirBuilderExt;
-    let home = std::env::var_os("HOME").ok_or("Cannot locate SSH identity storage.")?;
-    let dir = PathBuf::from(home).join(".ssh");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|e| e.to_string())?;
+    let home = codesync::platform::home().ok_or("Cannot locate SSH identity storage.")?;
+    let dir = home.join(".ssh");
+    codesync::platform::private_directory(&dir, true).map_err(|e| e.to_string())?;
     let file = dir.join("codesync_known_hosts");
     if !file.exists() {
         return Ok(false);
     }
-    let output = Command::new("ssh-keygen")
+    let output = codesync::platform::command("ssh-keygen")
         .arg("-F")
         .arg(server.identity_alias())
         .arg("-f")
-        .arg(file)
+        .arg(codesync::platform::local_path(&file))
         .output()
         .map_err(|e| format!("Cannot inspect saved server identity: {e}"))?;
     match output.status.code() {
@@ -903,7 +972,7 @@ fn resolve_endpoint(
                 }
             }
         }
-        let mut command = Command::new("ssh");
+        let mut command = codesync::platform::command("ssh");
         command
             .args(args)
             .arg(candidate.server.destination())
@@ -1004,18 +1073,22 @@ fn resolve_endpoint(
     }
     Err("No configured address connected with the saved SSH identity and credentials. No files were transferred. Check the server's addresses, credentials, and network access.".into())
 }
+#[cfg(unix)]
 const STOP_SSH_HELPER: &str = "/usr/local/libexec/codesync-stop-ssh";
+#[cfg(unix)]
 fn stop_ssh_helper() -> String {
     format!(
         "#!/bin/sh\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\nexport PATH\nunset ENV BASH_ENV CDPATH\n[ \"$#\" -eq 0 ] || exit 2\nset -- disable\n{}",
         include_str!("host-control.sh")
     )
 }
+#[cfg(unix)]
 fn stop_ssh_policy(uid: u32) -> String {
     format!(
         "# Codesync: only stop SSH, never enable it or run arbitrary commands.\n#{uid} ALL=(root) NOPASSWD: NOSETENV: {STOP_SSH_HELPER} \"\"\n"
     )
 }
+#[cfg(unix)]
 fn host_setup_script(uid: u32) -> String {
     let policy_setup = if uid == 0 {
         String::new()
@@ -1071,6 +1144,7 @@ fn tailscale_address(json: &str) -> Result<String, String> {
         .ok_or_else(|| "Tailscale did not return a server address.".into())
 }
 impl Runner<'_> {
+    #[cfg(unix)]
     fn disable_host(&mut self) -> Result<(), String> {
         let mut command = if unsafe { libc::geteuid() } == 0 {
             let mut command = Command::new("sh");
@@ -1088,6 +1162,7 @@ impl Runner<'_> {
         command.env("SUDO_ASKPASS", "/bin/false");
         self.execute(command, None).map_err(|e| format!("Could not turn SSH off without a password: {e} Run Connections > Prepare this host once to install the limited shutdown permission, then retry."))
     }
+    #[cfg(unix)]
     fn request_host_password(&self, purpose: &str) -> Result<String, String> {
         let (response, receiver) = mpsc::channel();
         self.events
@@ -1099,6 +1174,7 @@ impl Runner<'_> {
         self.ctx.request_repaint();
         wait_for_host_password(receiver, self.cancelled)
     }
+    #[cfg(unix)]
     fn setup_host(&mut self, script: &str, purpose: &str, mode: OutputMode) -> Result<(), String> {
         if unsafe { libc::geteuid() } == 0 {
             let mut command = Command::new("sh");
@@ -1138,6 +1214,21 @@ impl Runner<'_> {
                 .map(|_| ()).map_err(|e| format!("Host setup ({purpose}): {e} Install sudo to use the in-app password dialog, or start a desktop Polkit agent."));
         }
         Err("Host setup requires sudo or pkexec. Install sudo, then retry host setup.".into())
+    }
+    #[cfg(windows)]
+    fn disable_host(&mut self) -> Result<(), String> {
+        Err("Incoming SSH setup is supported on Linux only.".into())
+    }
+    #[cfg(windows)]
+    fn setup_host(
+        &mut self,
+        _script: &str,
+        purpose: &str,
+        _mode: OutputMode,
+    ) -> Result<(), String> {
+        Err(format!(
+            "For {purpose}, install and sign in to the Windows Tailscale app, then retry. Incoming SSH setup is Linux-only."
+        ))
     }
     fn setup_tailscale(&mut self) -> Result<(), String> {
         let script = include_str!("tailscale-setup.sh");
@@ -1266,7 +1357,36 @@ impl Output {
         }
     }
 }
-#[cfg(test)]
+
+fn local_host_setup_script() -> String {
+    #[cfg(unix)]
+    {
+        host_setup_script(unsafe { libc::getuid() })
+    }
+    #[cfg(windows)]
+    {
+        String::new()
+    }
+}
+fn stop_child(child: &mut std::process::Child, force: bool) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(
+            -(child.id() as i32),
+            if force { libc::SIGKILL } else { libc::SIGTERM },
+        );
+    }
+    #[cfg(windows)]
+    {
+        let _ = force;
+        let _ = Command::new("taskkill.exe")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status();
+        let _ = child.kill();
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[test]

@@ -142,6 +142,7 @@ fn ssh_banner(address: SocketAddr) -> bool {
     false
 }
 
+#[cfg(unix)]
 pub fn local_networks() -> Vec<String> {
     let mut networks = BTreeSet::new();
     // getifaddrs owns the linked list until freeifaddrs; only AF_INET pointers are cast.
@@ -169,6 +170,36 @@ pub fn local_networks() -> Vec<String> {
             current = interface.ifa_next;
         }
         libc::freeifaddrs(list);
+    }
+    networks.into_iter().collect()
+}
+
+#[cfg(windows)]
+pub fn local_networks() -> Vec<String> {
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+            "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -ne '127.0.0.1' } | ForEach-Object { '{0}/{1}' -f $_.IPAddress,$_.PrefixLength }"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    let mut networks = BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((address, prefix)) = line.trim().split_once('/') else {
+            continue;
+        };
+        let (Ok(address), Ok(prefix)) = (address.parse::<Ipv4Addr>(), prefix.parse::<u32>()) else {
+            continue;
+        };
+        if prefix > 32 {
+            continue;
+        }
+        let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+        networks.insert(format!(
+            "{}/{}",
+            Ipv4Addr::from(u32::from(address) & mask),
+            prefix
+        ));
     }
     networks.into_iter().collect()
 }

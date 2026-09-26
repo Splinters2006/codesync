@@ -1,4 +1,5 @@
 use std::{env, fs, process::Command};
+pub mod platform;
 mod update;
 
 const HELP: &str = "codesync — sync code and notes over SSH
@@ -25,6 +26,7 @@ pub const EXCLUDES: [&str; 8] = [
 
 const SETUP: &str = include_str!("setup.sh");
 // Shared by direct SSH commands and rsync's SSH transport.
+#[cfg(not(windows))]
 const SSH_OPTIONS: [&str; 6] = [
     "-o",
     "ControlMaster=auto",
@@ -32,6 +34,16 @@ const SSH_OPTIONS: [&str; 6] = [
     "ControlPersist=10m",
     "-o",
     "ControlPath=~/.ssh/codesync-%C",
+];
+
+#[cfg(windows)]
+const SSH_OPTIONS: [&str; 6] = [
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPersist=no",
+    "-o",
+    "ControlPath=none",
 ];
 
 fn ssh_transport() -> String {
@@ -127,7 +139,7 @@ impl Config {
         Ok(config)
     }
     fn ssh(&self, script: &str, interactive: bool) -> Result<(), String> {
-        let mut cmd = Command::new("ssh");
+        let mut cmd = platform::command("ssh");
         cmd.args(SSH_OPTIONS);
         if interactive {
             cmd.arg("-t");
@@ -142,10 +154,40 @@ impl Config {
             })
     }
     fn sync(&self, pull: bool, dry: bool) -> Result<(), String> {
+        if cfg!(windows) {
+            let mut inspect = if pull {
+                platform::command("ssh")
+            } else {
+                platform::command("sh")
+            };
+            if pull {
+                inspect
+                    .args(SSH_OPTIONS)
+                    .arg(ssh_destination(&self.host))
+                    .arg(platform::windows_manifest_script(&self.dir));
+            } else {
+                inspect.args(["-c", &platform::windows_manifest_script(".")]);
+            }
+            let output = inspect
+                .stdin(std::process::Stdio::inherit())
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Cannot inspect Linux filenames: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            platform::validate_windows_manifest(
+                std::str::from_utf8(&output.stdout)
+                    .map_err(|_| "Linux filenames must be UTF-8 on Windows.")?,
+            )?;
+        }
+
         if !pull && !dry {
             self.ssh(&format!("mkdir -p -- {}", quote(&self.dir)), false)?;
         }
-        let mut cmd = Command::new("rsync");
+        let mut cmd = platform::command("rsync");
         cmd.args(["-az", "--protect-args", "--itemize-changes", "-e"])
             .arg(ssh_transport());
         for pattern in EXCLUDES {
@@ -155,6 +197,7 @@ impl Config {
             cmd.arg("--dry-run");
         }
         let remote = rsync_destination(&self.host, &self.dir);
+        platform::rsync_options(&mut cmd);
         cmd.arg("--");
         if pull {
             cmd.arg(remote).arg("./");
@@ -189,7 +232,7 @@ pub fn run_cli(args: Vec<String>) -> Result<(), String> {
             }
             let executable = env::current_exe()
                 .map_err(|e| e.to_string())?
-                .with_file_name("codesync-gui");
+                .with_file_name(format!("codesync-gui{}", env::consts::EXE_SUFFIX));
             execute(&mut Command::new(executable))?;
         }
         "init" => {
@@ -326,6 +369,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg(unix)]
     fn shell_arguments_roundtrip() {
         for input in ["", "hello world", "it's a note", "; $(whoami)\n*"] {
             let output = Command::new("sh")

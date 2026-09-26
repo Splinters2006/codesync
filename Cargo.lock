@@ -287,6 +287,7 @@ name = "codesync"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "getrandom 0.3.4",
  "libc",
  "serde",
  "serde_json",
