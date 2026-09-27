@@ -64,3 +64,29 @@ copies and conflict renames remain. Retry Sync to bring the remaining copies up
 to date. Keep backups for important work.
 
 The CLI's `push` and `pull` retain their explicit one-way behavior.
+
+
+## Delete files from hosts and servers
+
+In the file browser, click **Delete…** beside a regular file. The confirmation
+dialog lists the current copy and known copies from saved folder/server links.
+Uncheck locations to delete only on this host or only on chosen servers; leave
+all selected to delete from both sides of a server or peer connection. The dialog
+shows each exact path and server before you confirm permanent deletion.
+
+All selected locations are checked first using the normal SSH credentials and
+fingerprint verification. An unavailable server or a path that is a directory,
+symlink, or special file stops the preflight without deleting files. Deletion
+processes remote copies before local copies and rechecks paths. It never deletes
+folders recursively or follows symlink parents. Already-missing files are skipped,
+so you can retry a partially completed operation. A network failure during deletion
+can leave some copies deleted; the result names the failed location and reports
+how many locations completed. A lost SSH reply may mean that location completed
+too. Stop does not undo deletions or guarantee that a remote command stopped.
+
+There are no deletion markers or queued offline deletions. Ordinary sync still
+restores missing files from existing copies. Remove all linked copies to keep a
+file gone, and handle any unlisted machines separately. From the server browser,
+matching `codesync/...` links reveal their local and other server copies. For
+custom absolute remote destinations, use the linked local folder's **Files** view
+so Codesync can use its saved mapping without guessing the server's home path.

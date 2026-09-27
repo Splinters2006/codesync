@@ -38,6 +38,7 @@ pub struct RemoteRequest {
 }
 pub struct Browser {
     remote: Option<u64>,
+    delete_request: Option<super::deletion::Target>,
     pending: Option<RemoteRequest>,
     waiting: bool,
     root: PathBuf,
@@ -54,6 +55,7 @@ impl Browser {
     pub fn new(root: PathBuf, ctx: &egui::Context) -> Self {
         let mut browser = Self {
             remote: None,
+            delete_request: None,
             pending: None,
             waiting: false,
             root,
@@ -81,6 +83,7 @@ impl Browser {
             limited: false,
             error: None,
             remote: Some(server),
+            delete_request: None,
             pending: Some(RemoteRequest {
                 server,
                 path: "".into(),
@@ -88,6 +91,12 @@ impl Browser {
             }),
             waiting: true,
         }
+    }
+    pub fn take_delete_request(&mut self) -> Option<super::deletion::Target> {
+        self.delete_request.take()
+    }
+    pub fn refresh(&mut self, ctx: &egui::Context) {
+        self.load(self.relative.clone(), ctx);
     }
     pub fn take_request(&mut self) -> Option<RemoteRequest> {
         self.pending.take()
@@ -159,7 +168,7 @@ impl Browser {
             ctx.request_repaint();
         });
     }
-    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, can_delete: bool) {
         if let Some(receiver) = &self.listing
             && let Ok(result) = receiver.try_recv()
         {
@@ -236,6 +245,7 @@ impl Browser {
             ui.label("Directory listing truncated; browse a subfolder to narrow the list.");
         }
         let mut selected = None;
+        let mut delete = None;
         egui::Frame::new()
             .fill(egui::Color32::WHITE)
             .inner_margin(6.0)
@@ -255,7 +265,7 @@ impl Browser {
                                         Kind::Other => "Other",
                                     };
                                     ui.label(kind);
-                                    let width = (ui.available_width() - 90.0).max(40.0);
+                                    let width = (ui.available_width() - 155.0).max(40.0);
                                     if ui
                                         .add_sized(
                                             [width, 22.0],
@@ -270,6 +280,17 @@ impl Browser {
                                     }
                                     if entry.kind == Kind::File {
                                         ui.label(size_label(entry.size));
+                                        if ui
+                                            .add_enabled(
+                                                can_delete
+                                                    && self.listing.is_none()
+                                                    && !self.waiting,
+                                                egui::Button::new("Delete…"),
+                                            )
+                                            .clicked()
+                                        {
+                                            delete = Some(self.relative.join(&entry.name));
+                                        }
                                     }
                                 });
                             });
@@ -279,6 +300,24 @@ impl Browser {
                     ui.label("No files to show.");
                 }
             });
+        if let Some(path) = delete {
+            match super::deletion::relative(&path) {
+                Ok(path) => {
+                    self.delete_request = Some(match self.remote {
+                        Some(server) => super::deletion::Target::Remote {
+                            server,
+                            root: "codesync".into(),
+                            path,
+                        },
+                        None => super::deletion::Target::Local {
+                            root: self.root.clone(),
+                            path,
+                        },
+                    })
+                }
+                Err(error) => self.error = Some(error),
+            }
+        }
         if let Some((path, kind)) = selected
             && self.listing.is_none()
             && !self.waiting
@@ -312,7 +351,7 @@ impl Browser {
                 });
         }
         ui.label(
-            RichText::new("Read-only viewer. Select a folder to browse or a text file to preview.")
+            RichText::new("Select a folder to browse or a text file to preview. Delete… lets you choose which copies to remove.")
                 .small(),
         );
     }

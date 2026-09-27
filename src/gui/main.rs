@@ -1,5 +1,6 @@
 mod auth;
 mod browser;
+mod deletion;
 mod discovery;
 mod jobs;
 mod store;
@@ -53,7 +54,13 @@ struct FolderEditor {
     path: String,
     error: Option<String>,
 }
+struct DeleteDialog {
+    copies: Vec<(bool, jobs::DeleteCopy)>,
+}
 struct App {
+    delete_dialog: Option<DeleteDialog>,
+    deleting: bool,
+    deletion_report: Option<String>,
     data: Data,
     file_browser: Option<browser::Browser>,
     browser_title: String,
@@ -143,6 +150,9 @@ impl App {
             discovery_error: None,
             data,
             file_browser: None,
+            delete_dialog: None,
+            deleting: false,
+            deletion_report: None,
             browser_title: String::new(),
             connections: false,
             host_ssh_status: None,
@@ -340,7 +350,7 @@ impl App {
             self.start(vec![task], title, ctx);
         }
     }
-    fn poll(&mut self) {
+    fn poll(&mut self, ctx: &egui::Context) {
         let mut finished = None;
         let mut tailscale_ready = Vec::new();
         if let Some(job) = &self.job {
@@ -394,6 +404,18 @@ impl App {
         if let Some(result) = finished {
             if let Some(browser) = &mut self.file_browser {
                 browser.finish_remote(result.as_ref().err().map(String::as_str));
+            }
+            if self.deleting {
+                self.deletion_report = Some(match &result {
+                    Ok(()) => {
+                        "Selected file copies deleted. Already-missing copies were skipped.".into()
+                    }
+                    Err(error) => error.clone(),
+                });
+                self.deleting = false;
+                if let Some(browser) = &mut self.file_browser {
+                    browser.refresh(ctx);
+                }
             }
             self.logins.clear();
             self.job = None;
@@ -555,6 +577,9 @@ impl App {
     }
     fn show_file_browser(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("File browser");
+        if let Some(report) = &self.deletion_report {
+            ui.label(report);
+        }
         let (_, dropped) = ui.dnd_drop_zone::<Selection, _>(
             egui::Frame::new()
                 .fill(Color32::from_gray(245))
@@ -565,7 +590,7 @@ impl App {
                 ui.set_min_height(280.0);
                 if let Some(browser) = &mut self.file_browser {
                     ui.strong(&self.browser_title);
-                    browser.show(ui, ctx);
+                    browser.show(ui, ctx, self.job.is_none());
                 } else {
                     ui.label("Drag a folder or server name here to browse its files.");
                 }
@@ -573,6 +598,64 @@ impl App {
         );
         if let Some(item) = dropped {
             self.browse_item(*item, ctx);
+        }
+        if self.job.is_none()
+            && let Some(source) = self
+                .file_browser
+                .as_mut()
+                .and_then(|browser| browser.take_delete_request())
+        {
+            let result = deletion::targets(&self.data, source).and_then(|targets| {
+                targets
+                    .into_iter()
+                    .map(|target| {
+                        let (task, label) = match &target {
+                            deletion::Target::Local { root, path } => {
+                                (None, format!("This host: {}", root.join(path).display()))
+                            }
+                            deletion::Target::Remote { server, root, path } => {
+                                let saved = self
+                                    .data
+                                    .servers
+                                    .iter()
+                                    .find(|s| s.id == *server)
+                                    .ok_or("Server is no longer saved.")?;
+                                let task = Task {
+                                    server: saved.clone(),
+                                    credentials: self
+                                        .credentials
+                                        .get(server)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                    local: std::env::temp_dir(),
+                                    remote: root.clone(),
+                                    action: Action::Test,
+                                };
+                                (
+                                    Some(task),
+                                    format!(
+                                        "{} ({}): {root}/{path}",
+                                        saved.name,
+                                        saved.destination()
+                                    ),
+                                )
+                            }
+                        };
+                        Ok((
+                            true,
+                            jobs::DeleteCopy {
+                                target,
+                                task,
+                                label,
+                            },
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            });
+            match result {
+                Ok(copies) => self.delete_dialog = Some(DeleteDialog { copies }),
+                Err(error) => self.error = Some(error),
+            }
         }
         if self.job.is_none()
             && let Some(request) = self
@@ -588,6 +671,45 @@ impl App {
                 },
                 ctx,
             );
+        }
+    }
+    fn show_delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.delete_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Delete file").open(&mut open).collapsible(false).default_width(560.0).show(ctx, |ui| {
+            ui.label("Permanently delete the selected copies of this file?");
+            ui.label("This cannot be undone. Choose the host and server copies to remove:");
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for (selected, copy) in &mut dialog.copies { ui.checkbox(selected, &copy.label); }
+            });
+            ui.label("Unchecked or unlisted copies can restore the file on a later sync. Only saved links are included; for custom server paths, open the local folder's Files view to include its linked copies.");
+            ui.label("All selected locations must be reachable. If deletion fails partway through, completed deletions remain; check Activity and retry.");
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.job.is_none() && dialog.copies.iter().any(|(selected, _)| *selected), egui::Button::new("Delete selected copies")).clicked() { confirm = true; }
+                if ui.button("Cancel").clicked() { cancel = true; }
+            });
+        });
+        if confirm {
+            let copies = dialog
+                .copies
+                .into_iter()
+                .filter_map(|(selected, copy)| selected.then_some(copy))
+                .collect();
+            self.error = None;
+            self.logins.clear();
+            self.status = "Deleting selected file copies".into();
+            self.output = jobs::Output::default();
+            self.output
+                .append(b"Checking every selected location before deleting files...\n");
+            self.deleting = true;
+            self.deletion_report = None;
+            self.job = Some(jobs::Job::delete(copies, ctx.clone()));
+        } else if open && !cancel {
+            self.delete_dialog = Some(dialog);
         }
     }
     fn show_home(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -843,6 +965,7 @@ impl App {
     }
     fn close_focused_popup_on_escape(&mut self, ctx: &egui::Context) {
         let popups = [
+            (self.delete_dialog.is_some(), "Delete file"),
             (self.link_editor.is_some(), "Folder / server link"),
             (self.server_editor.is_some(), "Server settings"),
             (self.folder_editor.is_some(), "Folder settings"),
@@ -881,6 +1004,7 @@ impl App {
             .or_else(|| popups.iter().find(|(open, _)| *open))
             .map(|(_, title)| *title);
         match focused {
+            Some("Delete file") => self.delete_dialog = None,
             Some("Folder / server link") => self.link_editor = None,
             Some("Server settings") => self.server_editor = None,
             Some("Folder settings") => self.folder_editor = None,
@@ -1307,7 +1431,7 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, passwor
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        self.poll();
+        self.poll(ctx);
         self.poll_discovery();
         if let Some(receiver) = &self.host_status_request
             && let Ok(status) = receiver.try_recv()
@@ -1328,7 +1452,8 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let busy = self.job.is_some();
-        let dialog = self.discovery_settings
+        let dialog = self.delete_dialog.is_some()
+            || self.discovery_settings
             || self.connections
             || self.folder_editor.is_some()
             || self.server_editor.is_some()
@@ -1420,5 +1545,6 @@ impl eframe::App for App {
             });
         });
         self.show_dialogs(ctx);
+        self.show_delete_dialog(ctx);
     }
 }

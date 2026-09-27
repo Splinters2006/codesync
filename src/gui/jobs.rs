@@ -72,11 +72,30 @@ pub struct Job {
 }
 impl Job {
     pub fn start(tasks: Vec<Task>, ctx: eframe::egui::Context) -> Self {
+        Self::operation(ctx, move |cancelled, events, ctx| {
+            run_tasks(tasks, cancelled, events, ctx)
+        })
+    }
+    pub fn delete(copies: Vec<DeleteCopy>, ctx: eframe::egui::Context) -> Self {
+        Self::operation(ctx, move |cancelled, events, ctx| {
+            delete_copies(copies, cancelled, events, ctx)
+        })
+    }
+    fn operation(
+        ctx: eframe::egui::Context,
+        operation: impl FnOnce(
+            &AtomicBool,
+            &Sender<Event>,
+            &eframe::egui::Context,
+        ) -> Result<(), String>
+        + Send
+        + 'static,
+    ) -> Self {
         let (events_tx, events) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancelled = cancel.clone();
         let worker = thread::spawn(move || {
-            let result = run_tasks(tasks, &cancelled, &events_tx, &ctx);
+            let result = operation(&cancelled, &events_tx, &ctx);
             let _ = events_tx.send(Event::Finished(result));
             ctx.request_repaint();
         });
@@ -95,6 +114,119 @@ impl Drop for Job {
         self.cancel();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+    }
+}
+
+pub struct DeleteCopy {
+    pub target: super::deletion::Target,
+    pub task: Option<Task>,
+    pub label: String,
+}
+fn delete_copies(
+    mut copies: Vec<DeleteCopy>,
+    cancelled: &AtomicBool,
+    events: &Sender<Event>,
+    ctx: &eframe::egui::Context,
+) -> Result<(), String> {
+    if copies.is_empty() {
+        return Err("No file copies selected.".into());
+    }
+    let mut bridge = Bridge::new()?;
+    // Keep local copies until the selected remote copies have been processed.
+    copies.sort_by_key(|copy| copy.task.is_none());
+    for copy in &mut copies {
+        let check = (|| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("Stopped.".into());
+            }
+            if let Some(task) = copy.task.take() {
+                task.server.validate()?;
+                copy.task = Some(resolve_endpoint(task, &mut bridge, cancelled, events, ctx)?);
+            }
+            delete_copy(copy, false, &mut bridge, cancelled, events, ctx)?;
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = check {
+            return Err(format!(
+                "Could not check {}: {error} No files were deleted.",
+                copy.label
+            ));
+        }
+    }
+    remove_copies(&copies, &mut bridge, cancelled, events, ctx)
+}
+fn remove_copies(
+    copies: &[DeleteCopy],
+    bridge: &mut Bridge,
+    cancelled: &AtomicBool,
+    events: &Sender<Event>,
+    ctx: &eframe::egui::Context,
+) -> Result<(), String> {
+    for (completed, copy) in copies.iter().enumerate() {
+        let result = delete_copy(copy, true, bridge, cancelled, events, ctx);
+        match result {
+            Ok(output) => {
+                let _ = events.send(Event::Output(
+                    format!("{}: {}\n", copy.label, output.trim()).into_bytes(),
+                ));
+                ctx.request_repaint();
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Deletion stopped at {}: {error} {completed}/{} locations completed. This location may also have completed if the connection was lost. Completed deletions cannot be undone; remaining copies may restore the file during sync. Refresh and retry the selected locations.",
+                    copy.label,
+                    copies.len()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+fn delete_copy(
+    copy: &DeleteCopy,
+    remove: bool,
+    bridge: &mut Bridge,
+    cancelled: &AtomicBool,
+    events: &Sender<Event>,
+    ctx: &eframe::egui::Context,
+) -> Result<String, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("Stopped.".into());
+    }
+    match &copy.target {
+        super::deletion::Target::Local { root, path } => {
+            let root = std::path::absolute(root).map_err(|e| e.to_string())?;
+            let script =
+                super::deletion::script(&codesync::platform::local_path(&root), path, remove)?;
+            let output = codesync::platform::command("sh")
+                .args(["-c", &script])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().into());
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        super::deletion::Target::Remote { root, path, .. } => {
+            let task = copy
+                .task
+                .as_ref()
+                .ok_or("Missing server connection for deletion.")?;
+            codesync::Config {
+                host: task.server.destination(),
+                dir: root.clone(),
+            }
+            .validate()?;
+            let script = super::deletion::script(root, path, remove)?;
+            Runner {
+                task,
+                bridge,
+                cancelled,
+                events,
+                ctx,
+            }
+            .execute_output(ssh(&task.server, &script), None, OutputMode::Capture)
         }
     }
 }
@@ -1446,6 +1578,116 @@ mod tests {
                 .unwrap()
                 .code()
                 == Some(2)
+        );
+    }
+
+    #[test]
+    fn deletion_preflights_all_selected_copies_and_retry_skips_missing_files() {
+        use super::super::deletion::Target;
+        let scratch = super::super::sync::Scratch::new().unwrap();
+        let first = scratch.0.join("first");
+        let second = scratch.0.join("second");
+        for root in [&first, &second] {
+            std::fs::create_dir(root).unwrap();
+        }
+        std::fs::write(first.join("file"), "first copy").unwrap();
+        std::fs::create_dir(second.join("file")).unwrap();
+        let copies = || {
+            [first.clone(), second.clone()]
+                .into_iter()
+                .map(|root| DeleteCopy {
+                    label: root.display().to_string(),
+                    target: Target::Local {
+                        root,
+                        path: "file".into(),
+                    },
+                    task: None,
+                })
+                .collect()
+        };
+        let (events, _output) = mpsc::channel();
+        let ctx = eframe::egui::Context::default();
+        let cancel = AtomicBool::new(false);
+        assert!(
+            delete_copies(copies(), &cancel, &events, &ctx)
+                .unwrap_err()
+                .contains("No files were deleted")
+        );
+        assert!(first.join("file").is_file());
+        std::fs::remove_dir(second.join("file")).unwrap();
+        assert!(delete_copies(copies(), &AtomicBool::new(true), &events, &ctx).is_err());
+        assert!(first.join("file").is_file());
+        std::fs::write(second.join("file"), "second copy").unwrap();
+        let mut bridge = Bridge::new().unwrap();
+        let checked = copies();
+        for copy in &checked {
+            delete_copy(copy, false, &mut bridge, &cancel, &events, &ctx).unwrap();
+        }
+        // A path changes after preflight: earlier deletions are reported and the directory is preserved.
+        std::fs::remove_file(second.join("file")).unwrap();
+        std::fs::create_dir(second.join("file")).unwrap();
+        let error = remove_copies(&checked, &mut bridge, &cancel, &events, &ctx).unwrap_err();
+        assert!(error.contains("1/2 locations completed"));
+        assert!(!first.join("file").exists());
+        assert!(second.join("file").is_dir());
+        std::fs::remove_dir(second.join("file")).unwrap();
+        std::fs::write(second.join("file"), "second copy").unwrap();
+        delete_copies(copies(), &cancel, &events, &ctx).unwrap();
+        assert!(!first.join("file").exists());
+        assert!(!second.join("file").exists());
+        delete_copies(copies(), &cancel, &events, &ctx).unwrap();
+    }
+
+    #[test]
+    fn remote_deletion_uses_ssh_transport_and_preserves_unselected_files() {
+        use super::super::deletion::Target;
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = super::super::sync::Scratch::new().unwrap();
+        if std::env::var_os("CODESYNC_DELETE_TEST_TRANSPORT").is_none() {
+            let wrapper = scratch.0.join("ssh");
+            std::fs::write(&wrapper, "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do if [ \"$1\" = delete-test-host ]; then shift; exec sh -c \"$*\"; fi; shift; done\nexit 1\n").unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut paths = vec![scratch.0.clone()];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "jobs::tests::remote_deletion_uses_ssh_transport_and_preserves_unselected_files", "--nocapture"])
+                .env("CODESYNC_DELETE_TEST_TRANSPORT", "1").env("PATH", std::env::join_paths(paths).unwrap()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut task = task();
+        task.server.host = "delete-test-host".into();
+        task.server.user.clear();
+        let remote = scratch.0.join("remote ' folder");
+        std::fs::create_dir(&remote).unwrap();
+        std::fs::write(remote.join("file"), "remote copy").unwrap();
+        std::fs::write(remote.join("keep"), "untouched").unwrap();
+        let copy = DeleteCopy {
+            target: Target::Remote {
+                server: task.server.id,
+                root: remote.to_str().unwrap().into(),
+                path: "file".into(),
+            },
+            task: Some(task),
+            label: "Remote".into(),
+        };
+        let mut bridge = Bridge::new().unwrap();
+        let (events, _output) = mpsc::channel();
+        let ctx = eframe::egui::Context::default();
+        let cancel = AtomicBool::new(false);
+        // Endpoint identity resolution uses the existing tested path; this wrapper exercises the actual delete command over SSH.
+        delete_copy(&copy, false, &mut bridge, &cancel, &events, &ctx).unwrap();
+        assert!(remote.join("file").exists());
+        delete_copy(&copy, true, &mut bridge, &cancel, &events, &ctx).unwrap();
+        assert!(!remote.join("file").exists());
+        assert_eq!(
+            std::fs::read_to_string(remote.join("keep")).unwrap(),
+            "untouched"
         );
     }
 

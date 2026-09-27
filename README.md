@@ -104,6 +104,20 @@ lists folders first and limits text previews to 256 KiB. Binary files and symbol
 links are listed but not opened. Dropping a server opens its files; it does not
 start a sync.
 
+Use **Delete…** beside a file in the browser to permanently remove it. The dialog
+lists this host and its saved linked server/peer copies; select the copies to
+delete, then choose **Delete selected copies**. All listed copies are selected
+initially. Every selected location is checked before deletion starts. Unreachable
+locations or invalid paths stop the checks without deleting anything. If a later
+delete fails, Activity and the browser report partial completion; refresh and
+retry. Missing copies are safely skipped on retry. Folders and links cannot be
+deleted with this control.
+
+Deleting all linked copies prevents the next sync from restoring the file. Copies
+left on unchecked or unlisted machines can still restore it. For custom remote
+directories, open the local folder's **Files** view to select its linked copies.
+This works for Linux servers and Linux peers, with Linux or Windows clients.
+
 Home includes **Remove** buttons for folders and servers. They remove the entry
 and its links from Codesync, leaving all files in place. The **Hosts** section on the right
 shows this computer's **Accept SSH connections** checkbox on Linux. Checking it installs
@@ -145,8 +159,7 @@ versions shared by several hosts produce one copy. If a prefixed name already
 exists, a hash fragment and counter distinguish it without replacing that file.
 
 All selected copies of one local folder are compared together. Batches stop on
-failure; completed copies and conflict renames remain in place. Deletions are
-never propagated, and missing files can be restored from another participant.
+failure; completed copies and conflict renames remain in place. Ordinary sync does not propagate deletions, and missing files can be restored from another participant. Use **Delete…** to explicitly remove selected copies.
 See [two-way sync](docs/sync.md) for behavior and limitations.
 
 Use the CLI's `codesync run` to run commands or `codesync shell` for interactive
