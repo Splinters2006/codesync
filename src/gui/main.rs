@@ -611,53 +611,55 @@ impl App {
                 .as_mut()
                 .and_then(|browser| browser.take_delete_request())
         {
-            let result = deletion::targets(&self.data, source).and_then(|targets| {
-                targets
-                    .into_iter()
-                    .map(|target| {
-                        let (task, label) = match &target {
-                            deletion::Target::Local { root, path } => {
-                                (None, format!("This host: {}", root.join(path).display()))
-                            }
-                            deletion::Target::Remote { server, root, path } => {
-                                let saved = self
-                                    .data
-                                    .servers
-                                    .iter()
-                                    .find(|s| s.id == *server)
-                                    .ok_or("Server is no longer saved.")?;
-                                let task = Task {
-                                    server: saved.clone(),
-                                    credentials: self
-                                        .credentials
-                                        .get(server)
-                                        .cloned()
-                                        .unwrap_or_default(),
-                                    local: std::env::temp_dir(),
-                                    remote: root.clone(),
-                                    action: Action::Test,
+            let result =
+                deletion::targets(&self.data, source, &self.home_folders, &self.home_servers)
+                    .and_then(|targets| {
+                        targets
+                            .into_iter()
+                            .map(|target| {
+                                let (task, label) = match &target {
+                                    deletion::Target::Local { root, path } => {
+                                        (None, format!("This host: {}", root.join(path).display()))
+                                    }
+                                    deletion::Target::Remote { server, root, path } => {
+                                        let saved = self
+                                            .data
+                                            .servers
+                                            .iter()
+                                            .find(|s| s.id == *server)
+                                            .ok_or("Server is no longer saved.")?;
+                                        let task = Task {
+                                            server: saved.clone(),
+                                            credentials: self
+                                                .credentials
+                                                .get(server)
+                                                .cloned()
+                                                .unwrap_or_default(),
+                                            local: std::env::temp_dir(),
+                                            remote: root.clone(),
+                                            action: Action::Test,
+                                        };
+                                        (
+                                            Some(task),
+                                            format!(
+                                                "{} ({}): {root}/{path}",
+                                                saved.name,
+                                                saved.destination()
+                                            ),
+                                        )
+                                    }
                                 };
-                                (
-                                    Some(task),
-                                    format!(
-                                        "{} ({}): {root}/{path}",
-                                        saved.name,
-                                        saved.destination()
-                                    ),
-                                )
-                            }
-                        };
-                        Ok((
-                            true,
-                            jobs::DeleteCopy {
-                                target,
-                                task,
-                                label,
-                            },
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, String>>()
-            });
+                                Ok((
+                                    true,
+                                    jobs::DeleteCopy {
+                                        target,
+                                        task,
+                                        label,
+                                    },
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, String>>()
+                    });
             match result {
                 Ok(copies) => self.delete_dialog = Some(DeleteDialog { copies }),
                 Err(error) => self.error = Some(error),
@@ -685,7 +687,7 @@ impl App {
         let mut cancel = false;
         egui::Window::new("Delete file").open(&mut open).collapsible(false).default_width(560.0).show(ctx, |ui| {
             ui.label("Permanently delete the selected copies of this file?");
-            ui.label("This cannot be undone. Choose the host and server copies to remove:");
+            ui.label("Only locations selected on Home are listed. Uncheck any copies to keep; deletion cannot be undone.");
             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                 for (selected, copy) in &mut dialog.copies { ui.checkbox(selected, &copy.label); }
             });

@@ -1,6 +1,9 @@
 //! Explicit file deletion. Missing copies are successful no-ops so partial jobs can be retried.
 use super::store::{self, Data};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -37,8 +40,23 @@ fn validate_relative(path: &str) -> Result<(), String> {
 }
 
 /// Only infer copies from saved links. Never guess that two servers share a directory.
-pub fn targets(data: &Data, source: Target) -> Result<Vec<Target>, String> {
-    let mut result = vec![source.clone()];
+pub fn targets(
+    data: &Data,
+    source: Target,
+    selected_folders: &HashSet<u64>,
+    selected_servers: &HashSet<u64>,
+) -> Result<Vec<Target>, String> {
+    let mut result = Vec::new();
+    let selected = match &source {
+        Target::Local { root, .. } => data
+            .folders
+            .iter()
+            .any(|folder| folder.path == *root && selected_folders.contains(&folder.id)),
+        Target::Remote { server, .. } => selected_servers.contains(server),
+    };
+    if selected {
+        result.push(source.clone());
+    }
     let mut folders = Vec::new();
     match &source {
         Target::Local { root, path } => {
@@ -74,14 +92,20 @@ pub fn targets(data: &Data, source: Target) -> Result<Vec<Target>, String> {
             .iter()
             .find(|folder| folder.id == id)
             .ok_or("Folder is missing.")?;
-        push_unique(
-            &mut result,
-            Target::Local {
-                root: folder.path.clone(),
-                path: path.clone(),
-            },
-        );
-        for link in data.links.iter().filter(|link| link.folder == id) {
+        if selected_folders.contains(&id) {
+            push_unique(
+                &mut result,
+                Target::Local {
+                    root: folder.path.clone(),
+                    path: path.clone(),
+                },
+            );
+        }
+        for link in data
+            .links
+            .iter()
+            .filter(|link| link.folder == id && selected_servers.contains(&link.server))
+        {
             data.validate_link(link)?;
             let target = Target::Remote {
                 server: link.server,
@@ -91,6 +115,9 @@ pub fn targets(data: &Data, source: Target) -> Result<Vec<Target>, String> {
             // The browser and a folder link may describe the same remote file using different roots.
             push_unique(&mut result, target);
         }
+    }
+    if result.is_empty() {
+        return Err("Select this local folder and/or a linked server on Home before deleting. No copies of this file are selected.".into());
     }
     Ok(result)
 }
@@ -188,23 +215,52 @@ mod tests {
             root: "/work/notes".into(),
             path: "sub/file.txt".into(),
         };
-        let targets = super::targets(&data, local.clone()).unwrap();
+        let targets = super::targets(&data, local.clone(), &[1].into(), &[2, 3].into()).unwrap();
         assert_eq!(targets.len(), 3);
         let remote = Target::Remote {
             server: 2,
             root: "codesync".into(),
             path: "notes/sub/file.txt".into(),
         };
-        let copies = super::targets(&data, remote).unwrap();
+        let copies = super::targets(&data, remote.clone(), &[1].into(), &[2, 3].into()).unwrap();
         assert_eq!(copies.len(), 3);
         assert!(copies.contains(&local));
         assert!(copies.contains(&targets[2]));
+        // Browsing a location never implicitly selects it for deletion.
+        for source in [local.clone(), remote] {
+            assert_eq!(
+                super::targets(&data, source.clone(), &HashSet::new(), &[3].into()).unwrap(),
+                vec![targets[2].clone()]
+            );
+            assert_eq!(
+                super::targets(&data, source.clone(), &[1].into(), &HashSet::new()).unwrap(),
+                vec![local.clone()]
+            );
+            let both = super::targets(&data, source.clone(), &[1].into(), &[3].into()).unwrap();
+            assert_eq!(both.len(), 2);
+            assert!(both.contains(&local));
+            assert!(both.contains(&targets[2]));
+            assert!(super::targets(&data, source, &HashSet::new(), &HashSet::new()).is_err());
+        }
+        // Unselected links are not validated or contacted.
+        let mut stale = data.clone();
+        stale.links[1].remote = "invalid-path".into();
+        assert_eq!(
+            super::targets(&stale, local.clone(), &[1].into(), &HashSet::new()).unwrap(),
+            vec![local]
+        );
+
         let unrelated = Target::Remote {
             server: 2,
             root: "codesync".into(),
             path: "notes-other/file.txt".into(),
         };
-        assert_eq!(super::targets(&data, unrelated).unwrap().len(), 1);
+        assert_eq!(
+            super::targets(&data, unrelated, &[1].into(), &[2, 3].into())
+                .unwrap()
+                .len(),
+            1
+        );
     }
     #[test]
     fn deletion_is_explicit_bounded_quoted_and_retryable() {

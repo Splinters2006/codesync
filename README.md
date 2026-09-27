@@ -110,9 +110,11 @@ use **Refresh files** to retry. Timed-out requests stop their local SSH processe
 with a brief cleanup period.
 
 Use **Delete…** beside a file in the browser to permanently remove it. The dialog
-lists this host and its saved linked server/peer copies; select the copies to
-delete, then choose **Delete selected copies**. All listed copies are selected
-initially. Every selected location is checked before deletion starts. Unreachable
+lists only copies at locations checked on **Home**: a checked local folder includes
+this host's copy, and checked linked servers include their copies. Browsing a
+location does not select it for deletion. Uncheck any additional copies to keep,
+then choose **Delete selected copies**. If no relevant locations are selected,
+no deletion starts. Every selected location is checked before deletion starts. Unreachable
 locations or invalid paths stop the checks without deleting anything. If a later
 delete fails, Activity and the browser report partial completion; refresh and
 retry. Missing copies are safely skipped on retry. Folders and links cannot be

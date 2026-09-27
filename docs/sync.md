@@ -69,10 +69,12 @@ The CLI's `push` and `pull` retain their explicit one-way behavior.
 ## Delete files from hosts and servers
 
 In the file browser, click **Delete…** beside a regular file. The confirmation
-dialog lists the current copy and known copies from saved folder/server links.
-Uncheck locations to delete only on this host or only on chosen servers; leave
-all selected to delete from both sides of a server or peer connection. The dialog
-shows each exact path and server before you confirm permanent deletion.
+dialog lists only copies at locations selected on **Home**, using saved
+folder/server links. Checking the local folder includes this host; checking a
+linked server or peer includes that remote copy. The location being browsed is
+not automatically included. With no relevant selections, deletion does not start.
+You can uncheck more copies in the dialog before confirming. Unselected locations
+are never added to the deletion job or contacted for its checks.
 
 All selected locations are checked first using the normal SSH credentials and
 fingerprint verification. An unavailable server or a path that is a directory,
