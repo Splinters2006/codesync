@@ -41,6 +41,7 @@ pub struct Browser {
     delete_request: Option<super::deletion::Target>,
     pending: Option<RemoteRequest>,
     waiting: bool,
+    in_flight: bool,
     root: PathBuf,
     relative: PathBuf,
     entries: Vec<Entry>,
@@ -58,6 +59,7 @@ impl Browser {
             delete_request: None,
             pending: None,
             waiting: false,
+            in_flight: false,
             root,
             relative: PathBuf::new(),
             entries: Vec::new(),
@@ -90,6 +92,7 @@ impl Browser {
                 preview: false,
             }),
             waiting: true,
+            in_flight: false,
         }
     }
     pub fn take_delete_request(&mut self) -> Option<super::deletion::Target> {
@@ -99,25 +102,32 @@ impl Browser {
         self.load(self.relative.clone(), ctx);
     }
     pub fn take_request(&mut self) -> Option<RemoteRequest> {
-        self.pending.take()
+        let request = self.pending.take();
+        if request.is_some() {
+            self.in_flight = true;
+        }
+        request
     }
     pub fn receive_listing(&mut self, server: u64, listing: Listing) {
-        if self.remote == Some(server) {
+        if self.remote == Some(server) && self.in_flight {
             self.relative = listing.relative;
             self.entries = listing.entries;
             self.limited = listing.limited;
             self.waiting = false;
+            self.in_flight = false;
         }
     }
     pub fn receive_preview(&mut self, server: u64, preview: Preview) {
-        if self.remote == Some(server) {
+        if self.remote == Some(server) && self.in_flight {
             self.preview = Some(preview);
             self.waiting = false;
+            self.in_flight = false;
         }
     }
     pub fn finish_remote(&mut self, error: Option<&str>) {
-        if self.remote.is_some() && self.waiting {
+        if self.remote.is_some() && self.in_flight {
             self.waiting = false;
+            self.in_flight = false;
             self.error = error.map(str::to_owned);
         }
     }
@@ -637,6 +647,32 @@ fn remote_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timeout_releases_browser_and_refresh_starts_a_new_request() {
+        let ctx = egui::Context::default();
+        let mut browser = Browser::remote(42);
+        // Finishing the previous job must not consume this browser's queued request.
+        browser.finish_remote(Some("Previous server timed out"));
+        assert!(browser.waiting);
+        assert!(browser.error.is_none());
+        assert!(browser.take_request().is_some());
+        browser.finish_remote(Some("Remote file browser timed out"));
+        assert!(!browser.waiting);
+        assert!(!browser.in_flight);
+        assert!(browser.error.as_ref().unwrap().contains("timed out"));
+        browser.refresh(&ctx);
+        assert!(browser.waiting);
+        assert!(browser.error.is_none());
+        // Ignore stale responses before the refreshed request has been dispatched.
+        let listing = remote_listing("PATH\0\0END\0").unwrap();
+        browser.receive_listing(42, listing);
+        assert!(browser.waiting);
+        let request = browser.take_request().unwrap();
+        assert_eq!(request.server, 42);
+        browser.receive_listing(42, remote_listing("PATH\0\0END\0").unwrap());
+        assert!(!browser.waiting);
+    }
+
     #[test]
     fn remote_listing_and_preview_handle_quoted_names_without_changes() {
         let script = remote_script("folder ' with spaces", false).unwrap();

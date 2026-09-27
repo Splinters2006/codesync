@@ -102,7 +102,12 @@ Select a subfolder to browse it or a text file for a read-only preview. The view
 has **Up**, **Refresh files**, file sizes, and **Show hidden files** controls. It
 lists folders first and limits text previews to 256 KiB. Binary files and symbolic
 links are listed but not opened. Dropping a server opens its files; it does not
-start a sync.
+start a sync. Remote browsing allows 5 seconds for an SSH connection attempt,
+10 seconds per command, and 30 seconds of network work across the entire listing
+or preview request. Waiting for fingerprint confirmation pauses these limits.
+An unreachable or stalled server shows an error and releases the browser controls;
+use **Refresh files** to retry. Timed-out requests stop their local SSH processes,
+with a brief cleanup period.
 
 Use **Delete…** beside a file in the browser to permanently remove it. The dialog
 lists this host and its saved linked server/peer copies; select the copies to

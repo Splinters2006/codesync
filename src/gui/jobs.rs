@@ -9,13 +9,17 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
 };
+
+const BROWSE_TIMEOUT: Duration = Duration::from_secs(30);
+const BROWSE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const BROWSE_TIMEOUT_MESSAGE: &str = "Remote file browser timed out. The server may be offline or unresponsive. Check the connection and click Refresh files to retry.";
 
 pub enum Event {
     BrowserListing {
@@ -49,13 +53,47 @@ pub enum Event {
 }
 #[derive(Clone)]
 pub enum Action {
-    Browse { path: String, preview: bool },
+    Browse {
+        path: String,
+        preview: bool,
+        deadline: Arc<Mutex<Instant>>,
+    },
     Test,
     Setup,
     Tailscale,
     PrepareHost,
     DisableHost,
     Sync,
+}
+impl Action {
+    pub fn browse(path: String, preview: bool) -> Self {
+        Self::Browse {
+            path,
+            preview,
+            deadline: Arc::new(Mutex::new(Instant::now() + BROWSE_TIMEOUT)),
+        }
+    }
+    fn command_deadline(&self, now: Instant) -> Option<Instant> {
+        match self {
+            Self::Browse { deadline, .. } => {
+                Some((*deadline.lock().unwrap()).min(now + BROWSE_COMMAND_TIMEOUT))
+            }
+            _ => None,
+        }
+    }
+    fn pause_deadline(&self, elapsed: Duration) {
+        if let Self::Browse { deadline, .. } = self {
+            *deadline.lock().unwrap() += elapsed;
+        }
+    }
+    fn check_deadline(&self) -> Result<(), String> {
+        if let Self::Browse { deadline, .. } = self
+            && Instant::now() >= *deadline.lock().unwrap()
+        {
+            return Err(BROWSE_TIMEOUT_MESSAGE.into());
+        }
+        Ok(())
+    }
 }
 #[derive(Clone)]
 pub struct Task {
@@ -402,7 +440,7 @@ fn run_tasks(
             ctx,
         };
         match &task.action {
-            Action::Browse { path, preview } => {
+            Action::Browse { path, preview, .. } => {
                 let script = super::browser::remote_script(path, *preview)?;
                 let output =
                     runner.execute_output(ssh(&task.server, &script), None, OutputMode::Capture)?;
@@ -736,10 +774,24 @@ impl Runner<'_> {
     }
     fn execute_output(
         &mut self,
-        mut command: Command,
+        command: Command,
         input: Option<&str>,
         mode: OutputMode,
     ) -> Result<String, String> {
+        self.execute_output_codes(command, input, mode, &[0])
+    }
+    fn execute_output_codes(
+        &mut self,
+        mut command: Command,
+        input: Option<&str>,
+        mode: OutputMode,
+        accepted_codes: &[i32],
+    ) -> Result<String, String> {
+        self.task.action.check_deadline()?;
+        let mut deadline = self.task.action.command_deadline(Instant::now());
+        if deadline.is_some() {
+            command = browser_ssh(command);
+        }
         if self.cancelled.load(Ordering::Relaxed) {
             return Err("Stopped.".into());
         }
@@ -828,21 +880,57 @@ impl Runner<'_> {
             }));
         }
         let mut stopping = None;
-        let status = loop {
-            if self.cancelled.load(Ordering::Relaxed) && stopping.is_none() {
-                stop_child(&mut child, false);
-                stopping = Some(Instant::now());
+        let mut timed_out = false;
+        let mut status = None;
+        let mut last_tick = Instant::now();
+        loop {
+            let now = Instant::now();
+            if stopping.is_none() && self.bridge.awaiting_confirmation() {
+                let elapsed = now.duration_since(last_tick);
+                self.task.action.pause_deadline(elapsed);
+                if let Some(end) = &mut deadline {
+                    *end += elapsed;
+                }
             }
-            self.bridge
-                .poll(&self.task.credentials, self.events, self.ctx);
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                break status;
+            last_tick = now;
+            if stopping.is_none() {
+                if self.cancelled.load(Ordering::Relaxed) {
+                    stop_child(&mut child, false);
+                    stopping = Some(Instant::now());
+                } else if deadline.is_some_and(|end| Instant::now() >= end) {
+                    timed_out = true;
+                    stop_child(&mut child, true);
+                    stopping = Some(Instant::now());
+                } else {
+                    self.bridge
+                        .poll(&self.task.credentials, self.events, self.ctx);
+                }
             }
-            if stopping.is_some_and(|time| time.elapsed() > Duration::from_secs(2)) {
+            if status.is_none() {
+                status = child.try_wait().map_err(|e| e.to_string())?;
+            }
+            // A child can exit while its descendants still hold stdout/stderr open.
+            // Keep enforcing the deadline until the reader threads finish too.
+            if status.is_some() && readers.iter().all(thread::JoinHandle::is_finished) {
+                break;
+            }
+            if stopping.is_some_and(|time| time.elapsed() >= Duration::from_secs(2)) {
                 stop_child(&mut child, true);
+                // Do not block the UI's Job::drop on a stuck descendant or pipe reader.
+                if status.is_none() {
+                    thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
+                return Err(if timed_out {
+                    BROWSE_TIMEOUT_MESSAGE.into()
+                } else {
+                    "Stopped. Files already transferred remain in place.".into()
+                });
             }
             thread::sleep(Duration::from_millis(30));
-        };
+        }
+        let status = status.unwrap();
         let mut streams = readers
             .into_iter()
             .map(|reader| reader.join().unwrap_or_default());
@@ -850,9 +938,14 @@ impl Runner<'_> {
         let stderr = streams.next().unwrap_or_default();
         for _ in streams {}
 
-        if stopping.is_some() {
+        if timed_out {
+            Err(BROWSE_TIMEOUT_MESSAGE.into())
+        } else if stopping.is_some() {
             Err("Stopped. Files already transferred remain in place.".into())
-        } else if status.success() {
+        } else if status
+            .code()
+            .is_some_and(|code| accepted_codes.contains(&code))
+        {
             Ok(String::from_utf8_lossy(&stdout).into_owned())
         } else {
             let program = std::path::Path::new(command.get_program())
@@ -866,6 +959,43 @@ impl Runner<'_> {
         }
     }
 }
+// Browser commands must not create or reuse a persistent SSH master: killing a
+// timed-out request should only terminate that request's connection.
+fn browser_ssh(command: Command) -> Command {
+    if std::path::Path::new(command.get_program())
+        .file_stem()
+        .is_none_or(|name| name != "ssh")
+    {
+        return command;
+    }
+    let mut bounded = Command::new(command.get_program());
+    // OpenSSH takes the first value of each option, ahead of the shared defaults.
+    bounded.args([
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ServerAliveInterval=5",
+        "-o",
+        "ServerAliveCountMax=1",
+    ]);
+    bounded.args(command.get_args());
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            bounded.env(key, value);
+        } else {
+            bounded.env_remove(key);
+        }
+    }
+    if let Some(directory) = command.get_current_dir() {
+        bounded.current_dir(directory);
+    }
+    bounded
+}
+
 #[derive(Clone, Copy)]
 enum OutputMode {
     Live,
@@ -963,7 +1093,8 @@ fn login_url(line: &str) -> Option<String> {
         .then(|| url.into())
     })
 }
-fn identity_known(server: &Server) -> Result<bool, String> {
+fn identity_known(runner: &mut Runner<'_>) -> Result<bool, String> {
+    runner.task.action.check_deadline()?;
     let home = codesync::platform::home().ok_or("Cannot locate SSH identity storage.")?;
     let dir = home.join(".ssh");
     codesync::platform::private_directory(&dir, true).map_err(|e| e.to_string())?;
@@ -971,18 +1102,16 @@ fn identity_known(server: &Server) -> Result<bool, String> {
     if !file.exists() {
         return Ok(false);
     }
-    let output = codesync::platform::command("ssh-keygen")
+    let mut command = codesync::platform::command("ssh-keygen");
+    command
         .arg("-F")
-        .arg(server.identity_alias())
+        .arg(runner.task.server.identity_alias())
         .arg("-f")
-        .arg(codesync::platform::local_path(&file))
-        .output()
-        .map_err(|e| format!("Cannot inspect saved server identity: {e}"))?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err("Cannot read the saved SSH server identities.".into()),
-    }
+        .arg(codesync::platform::local_path(&file));
+    // ssh-keygen -F returns 1 with no output when the identity is not saved yet.
+    runner
+        .execute_output_codes(command, None, OutputMode::Capture, &[0, 1])
+        .map(|output| !output.trim().is_empty())
 }
 fn peer_address(json: &str, configured: &str) -> Option<String> {
     let status: serde_json::Value = serde_json::from_str(json).ok()?;
@@ -1039,7 +1168,14 @@ fn resolve_endpoint(
     events: &Sender<Event>,
     ctx: &eframe::egui::Context,
 ) -> Result<Task, String> {
-    let known = identity_known(&task.server)?;
+    task.action.check_deadline()?;
+    let known = identity_known(&mut Runner {
+        task: &task,
+        bridge,
+        cancelled,
+        events,
+        ctx,
+    })?;
     if !known && matches!(task.action, Action::Sync) {
         return Err("Confirm this server's identity first: select the server and use Test connection. Check its fingerprint against the intended server.".into());
     }
@@ -1079,7 +1215,9 @@ fn resolve_endpoint(
     if endpoints.is_empty() {
         return Err("Remote only needs a public address or completed Tailscale setup. Edit the server's connection settings.".into());
     }
+    let mut browse_timed_out = false;
     for (host, port, label) in endpoints {
+        task.action.check_deadline()?;
         if cancelled.load(Ordering::Relaxed) {
             return Err("Stopped.".into());
         }
@@ -1118,7 +1256,13 @@ fn resolve_endpoint(
         }
         .execute_output(command, None, OutputMode::Capture);
         if result.is_ok() {
-            if !identity_known(&candidate.server)? {
+            if !identity_known(&mut Runner {
+                task: &candidate,
+                bridge,
+                cancelled,
+                events,
+                ctx,
+            })? {
                 return Err("The server's SSH identity was not saved. Check ~/.ssh permissions and retry Test connection.".into());
             }
             if label == "Tailscale" {
@@ -1196,12 +1340,17 @@ fn resolve_endpoint(
             return Err("Stopped.".into());
         }
         let reason = result.unwrap_err();
+        browse_timed_out |= reason == BROWSE_TIMEOUT_MESSAGE;
         if !known {
             return Err(format!(
                 "Initial server connection failed: {reason} Select Local only or Remote only to choose where to confirm its fingerprint."
             ));
         }
         let _ = events.send(Event::Output(format!("{label}: {reason}\n").into_bytes()));
+    }
+    task.action.check_deadline()?;
+    if browse_timed_out {
+        return Err(BROWSE_TIMEOUT_MESSAGE.into());
     }
     Err("No configured address connected with the saved SSH identity and credentials. No files were transferred. Check the server's addresses, credentials, and network access.".into())
 }
@@ -1932,6 +2081,113 @@ mod tests {
             .collect();
         assert_eq!(&args[args.len() - 2..], ["user@other:/backup/", "./"]);
     }
+    #[test]
+    fn browser_deadlines_cover_stalls_open_pipes_and_successive_commands() {
+        let mut bridge = Bridge::new().unwrap();
+        let (events, _output) = mpsc::channel();
+        let ctx = eframe::egui::Context::default();
+        let cancelled = AtomicBool::new(false);
+        for script in ["sleep 30", "sleep 30 & exit 0"] {
+            let mut task = task();
+            task.action = Action::Browse {
+                path: String::new(),
+                preview: false,
+                deadline: Arc::new(Mutex::new(Instant::now() + Duration::from_millis(150))),
+            };
+            let mut runner = Runner {
+                task: &task,
+                bridge: &mut bridge,
+                cancelled: &cancelled,
+                events: &events,
+                ctx: &ctx,
+            };
+            let start = Instant::now();
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            assert_eq!(
+                runner
+                    .execute_output(command, None, OutputMode::Capture)
+                    .unwrap_err(),
+                BROWSE_TIMEOUT_MESSAGE
+            );
+            assert!(start.elapsed() < Duration::from_secs(3));
+        }
+        let mut task = task();
+        task.action = Action::Browse {
+            path: String::new(),
+            preview: true,
+            deadline: Arc::new(Mutex::new(Instant::now() + Duration::from_millis(300))),
+        };
+        let mut runner = Runner {
+            task: &task,
+            bridge: &mut bridge,
+            cancelled: &cancelled,
+            events: &events,
+            ctx: &ctx,
+        };
+        let mut first = Command::new("sh");
+        first.args(["-c", "printf ready"]);
+        assert_eq!(
+            runner
+                .execute_output(first, None, OutputMode::Capture)
+                .unwrap(),
+            "ready"
+        );
+        let mut second = Command::new("sh");
+        second.args(["-c", "sleep 30"]);
+        assert_eq!(
+            runner
+                .execute_output(second, None, OutputMode::Capture)
+                .unwrap_err(),
+            BROWSE_TIMEOUT_MESSAGE
+        );
+        // An expired overall deadline must prevent further probes from even spawning.
+        assert_eq!(
+            runner
+                .execute_output(
+                    Command::new("codesync-nonexistent-test-command"),
+                    None,
+                    OutputMode::Capture
+                )
+                .unwrap_err(),
+            BROWSE_TIMEOUT_MESSAGE
+        );
+    }
+
+    #[test]
+    fn browser_commands_have_short_limits_without_affecting_sync() {
+        let now = Instant::now();
+        let action = Action::Browse {
+            path: String::new(),
+            preview: false,
+            deadline: Arc::new(Mutex::new(now + BROWSE_TIMEOUT)),
+        };
+        assert_eq!(
+            action.command_deadline(now),
+            Some(now + BROWSE_COMMAND_TIMEOUT)
+        );
+        assert_eq!(
+            action.command_deadline(now + Duration::from_secs(25)),
+            Some(now + BROWSE_TIMEOUT)
+        );
+        let candidate = action.clone();
+        action.pause_deadline(Duration::from_secs(60));
+        assert_eq!(
+            candidate.command_deadline(now + Duration::from_secs(85)),
+            Some(now + BROWSE_TIMEOUT + Duration::from_secs(60))
+        );
+        assert!(Action::Sync.command_deadline(now).is_none());
+        let task = task();
+        let original = ssh(&task.server, "true");
+        let limited = browser_ssh(ssh(&task.server, "true"));
+        let args: Vec<_> = limited.get_args().collect();
+        assert_eq!(args[1], "ControlMaster=no");
+        assert_eq!(args[3], "ControlPath=none");
+        assert_eq!(args[5], "ConnectTimeout=5");
+        assert!(original.get_args().any(|arg| arg == "ControlMaster=auto"));
+        assert_eq!(args.last().unwrap(), &"true");
+    }
+
     #[test]
     fn runner_reports_failure_and_cancels_process_group() {
         let task = task();

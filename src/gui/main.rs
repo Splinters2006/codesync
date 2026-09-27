@@ -348,6 +348,12 @@ impl App {
                 action,
             };
             self.start(vec![task], title, ctx);
+        } else if matches!(action, Action::Browse { .. }) {
+            let error = "This server is no longer saved. Add it again to browse its files.";
+            self.error = Some(error.into());
+            if let Some(browser) = &mut self.file_browser {
+                browser.finish_remote(Some(error));
+            }
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
@@ -665,10 +671,7 @@ impl App {
         {
             self.server_action(
                 request.server,
-                Action::Browse {
-                    path: request.path,
-                    preview: request.preview,
-                },
+                Action::browse(request.path, request.preview),
                 ctx,
             );
         }

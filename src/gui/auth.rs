@@ -139,6 +139,9 @@ impl Bridge {
             pending: None,
         })
     }
+    pub fn awaiting_confirmation(&self) -> bool {
+        self.pending.is_some()
+    }
     pub fn poll(
         &mut self,
         credentials: &Credentials,
