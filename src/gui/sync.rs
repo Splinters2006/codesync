@@ -39,7 +39,7 @@ pub fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 pub fn hash(path: &Path) -> Result<String, String> {
-    let out = codesync::platform::command("sha256sum")
+    let out = codesync::platform::background(&mut codesync::platform::command("sha256sum"))
         .arg("--")
         .arg(if cfg!(windows) {
             std::ffi::OsString::from(codesync::platform::local_path(path))

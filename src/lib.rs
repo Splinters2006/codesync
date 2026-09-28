@@ -13,11 +13,12 @@ const HELP: &str = "codesync — sync code and notes over SSH
   codesync shell
 Run sync commands from your project folder. Sync may overwrite files; preview with --dry-run.";
 
-pub const EXCLUDES: [&str; 8] = [
+pub const EXCLUDES: [&str; 9] = [
     ".git",
     "target",
     "node_modules",
     ".codesync",
+    ".codesync-passwords.enc*",
     ".env",
     ".env.*",
     "*.pem",

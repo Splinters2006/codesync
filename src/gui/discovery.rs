@@ -176,7 +176,7 @@ pub fn local_networks() -> Vec<String> {
 
 #[cfg(windows)]
 pub fn local_networks() -> Vec<String> {
-    let output = std::process::Command::new("powershell.exe")
+    let output = codesync::platform::background(&mut std::process::Command::new("powershell.exe"))
         .args(["-NoProfile", "-NonInteractive", "-Command",
             "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -ne '127.0.0.1' } | ForEach-Object { '{0}/{1}' -f $_.IPAddress,$_.PrefixLength }"])
         .output();

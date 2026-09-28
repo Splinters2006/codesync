@@ -1,2 +1,6 @@
 /target
+/dist
 .codesync
+
+# Local encrypted passwords, temporary writes, and save lock.
+.codesync-passwords.enc*

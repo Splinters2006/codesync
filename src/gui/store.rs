@@ -286,7 +286,7 @@ impl Data {
         folder
     }
 }
-fn directory() -> Result<PathBuf, String> {
+pub fn directory() -> Result<PathBuf, String> {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)

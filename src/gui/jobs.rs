@@ -237,7 +237,7 @@ fn delete_copy(
             let root = std::path::absolute(root).map_err(|e| e.to_string())?;
             let script =
                 super::deletion::script(&codesync::platform::local_path(&root), path, remove)?;
-            let output = codesync::platform::command("sh")
+            let output = codesync::platform::background(&mut codesync::platform::command("sh"))
                 .args(["-c", &script])
                 .output()
                 .map_err(|e| e.to_string())?;
@@ -820,12 +820,14 @@ impl Runner<'_> {
         command.process_group(0);
         #[cfg(windows)]
         command.env("CODESYNC_AUTH_TOKEN", &self.bridge.token);
-        let mut child = command.spawn().map_err(|e| {
-            format!(
-                "Cannot start {}: {e}",
-                command.get_program().to_string_lossy()
-            )
-        })?;
+        let mut child = codesync::platform::background(&mut command)
+            .spawn()
+            .map_err(|e| {
+                format!(
+                    "Cannot start {}: {e}",
+                    command.get_program().to_string_lossy()
+                )
+            })?;
         if let Some(secret) = input
             && let Some(mut stdin) = child.stdin.take()
         {
@@ -1660,7 +1662,7 @@ fn stop_child(child: &mut std::process::Child, force: bool) {
     #[cfg(windows)]
     {
         let _ = force;
-        let _ = Command::new("taskkill.exe")
+        let _ = codesync::platform::background(&mut Command::new("taskkill.exe"))
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .status();
         let _ = child.kill();

@@ -10,16 +10,13 @@ needs Wayland or X11 with OpenGL. Zenity is optional for its folder picker.
 Windows hosts run the native app and CLI with Cygwin transfer tools; see
 [Windows installation](docs/windows.md). Servers remain Linux-only.
 
-On Windows, after installing the prerequisites, run from PowerShell:
+On Windows, download the **codesync-windows-x64** artifact from a successful
+[Windows executable build](https://github.com/Splinters2006/codesync/actions/workflows/windows-package.yml),
+extract the ZIP, and double-click **codesync-gui.exe**. Rust and Cargo are not
+needed for the download. Install Cygwin's `openssh`, `rsync`, and `coreutils`
+first; see [Windows setup](docs/windows.md) for details and source builds.
 
-```powershell
-.\install.ps1
-codesync gui
-```
-
-Use `-CliOnly` for the CLI or `-PathOnly` to repair PATH. On Linux:
-
-From this repository:
+On Linux, keep using the terminal installer from this repository:
 
 ```sh
 ./install.sh
@@ -51,7 +48,7 @@ For an existing installation made with Cargo, repair PATH without rebuilding:
 
 ## Update from Git
 
-After installing a version with the updater, run this from any directory:
+For source installations with the updater, run this from any directory:
 
 ```sh
 codesync update
@@ -61,6 +58,9 @@ Codesync remembers the source checkout used to build it, runs
 `git pull --ff-only --no-rebase`, and reruns the installer. It preserves the
 installation directory and whether you installed the GUI or CLI-only build.
 Close and reopen the GUI afterward.
+
+For the Windows executable download, close the app and replace the executables
+with a newer download. Saved profiles and passwords stay in your user profile.
 
 If you moved the checkout or installed from a Git source cache, point to your clone:
 
@@ -220,9 +220,20 @@ must already work. See [remote access setup](docs/remote-access.md) for requirem
 
 ## Passwords and setup
 
-Passwords are remembered **only while the app is open**, and never written to the
-profile file. After restarting, use **Open** on the server to enter them again,
-or use an SSH key and agent. SSH and sudo are separate credentials: the login
+Server login and sudo passwords can be remembered in an encrypted local file,
+separate from the profile file. Saving your first password opens the vault setup:
+choose a master password of at least 12 characters. After restarting, unlock the
+vault once to restore saved passwords, or choose **Use without saved passwords**
+to use SSH keys/agent. The **Saved passwords…** toolbar button opens setup/unlock;
+**Lock passwords** clears the unlocked key and session credentials when idle.
+Editing servers with an existing locked vault requires unlocking it first.
+
+The file is `.codesync-passwords.enc` beside `profiles.json` (normally
+`~/.config/codesync/` on Linux or `%APPDATA%\codesync\` on Windows). It uses
+Argon2id and XChaCha20-Poly1305 authenticated encryption. The master password is
+never saved. The vault, temporary encrypted files, and lock file are ignored by
+Git and excluded from sync. See [encrypted password storage](docs/authentication.md#encrypted-local-passwords)
+for recovery and file details. SSH and sudo are separate credentials: the login
 password connects to the server; the sudo password is used only for server setup.
 Regular file transfers run as the SSH user and need writable remote directories.
 
@@ -243,7 +254,7 @@ separately. The GUI does not need util-linux `script` anymore.
 
 Servers, folders, and links are stored in
 `$XDG_CONFIG_HOME/codesync/profiles.json` (normally
-`~/.config/codesync/profiles.json`), or `%APPDATA%\codesync\profiles.json` on Windows. Credentials are kept separately in memory.
+`~/.config/codesync/profiles.json`), or `%APPDATA%\codesync\profiles.json` on Windows. Passwords are kept separately in the encrypted local vault and unlocked in memory for the current session.
 
 The previous `folders.json` list is imported and saved when there is no new profile file.
 Adding a folder with a `.codesync` file imports its existing server destination.
@@ -277,7 +288,7 @@ explicit one-way rsync operations that can overwrite edits and compare size and
 modification time by default. Keep Git history or backups.
 
 Excluded at any depth: `.git`, `target`, `node_modules`, `.codesync`, `.env`,
-`.env.*`, `*.pem`, `*.key`. GUI two-way sync accepts regular files and directories;
+`.env.*`, `*.pem`, `*.key`, `.codesync-passwords.enc*`. GUI two-way sync accepts regular files and directories;
 symbolic links and special files stop the operation before conflict renaming.
 Linux CLI transfers still support symlinks. Windows transfers require regular files and directories. Dry runs are CLI-only.
 
@@ -295,3 +306,9 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Authentication tests use local sockets; restricted sandboxes must allow those. CI checks Linux and Windows builds, tests, and installers.
+
+Build the Windows download with `python scripts/package_windows.py` on a Windows
+development machine (Python 3.10+, Rust MSVC, and Visual Studio C++ build tools).
+It writes both executables, a ZIP, and its SHA-256 checksum under `dist/`.
+The **Windows executable** workflow builds the same package for pushes to `main`,
+version tags, pull requests, and manual runs, and makes it available as an artifact.

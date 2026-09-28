@@ -8,6 +8,17 @@ pub fn home() -> Option<PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
 }
 
+/// GUI subprocesses keep their pipes without opening a console window on Windows.
+/// CLI commands deliberately do not use this, since SSH may need a terminal.
+pub fn background(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command
+}
+
 /// Cygwin supplies a matched SSH/rsync/coreutils toolchain on Windows.
 pub fn command(program: &str) -> Command {
     #[cfg(windows)]

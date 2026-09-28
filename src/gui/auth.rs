@@ -15,11 +15,18 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Credentials {
     pub login: String,
     pub sudo: String,
     pub same_password: bool,
+}
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.login.zeroize();
+        self.sudo.zeroize();
+    }
 }
 impl Credentials {
     pub fn sudo_password(&self) -> &str {
@@ -236,7 +243,8 @@ mod tests {
         let ctx = eframe::egui::Context::default();
         let creds = Credentials {
             login: "secret-test".into(),
-            ..Default::default()
+            sudo: String::new(),
+            same_password: false,
         };
         let mut socket = LocalStream::connect(&bridge.socket).unwrap();
         writeln!(
@@ -328,7 +336,8 @@ mod windows_tests {
         let ctx = eframe::egui::Context::default();
         let credentials = Credentials {
             login: "test-secret".into(),
-            ..Default::default()
+            sudo: String::new(),
+            same_password: false,
         };
         for valid in [false, true] {
             let mut stream = LocalStream::connect(bridge.socket.to_str().unwrap()).unwrap();

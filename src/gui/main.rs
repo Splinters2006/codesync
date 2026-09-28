@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod auth;
 mod browser;
 mod deletion;
@@ -5,6 +7,7 @@ mod discovery;
 mod jobs;
 mod store;
 mod sync;
+mod vault;
 
 use auth::Credentials;
 use eframe::egui::{self, Color32, RichText};
@@ -57,7 +60,17 @@ struct FolderEditor {
 struct DeleteDialog {
     copies: Vec<(bool, jobs::DeleteCopy)>,
 }
+type VaultResult = Result<(vault::Vault, vault::Passwords), String>;
 struct App {
+    vault: Option<vault::Vault>,
+    vault_dialog: bool,
+    vault_creating: bool,
+    vault_password: zeroize::Zeroizing<String>,
+    vault_confirm: zeroize::Zeroizing<String>,
+    vault_error: Option<String>,
+    vault_request: Option<mpsc::Receiver<VaultResult>>,
+    pending_server_editor: Option<Option<u64>>,
+    profiles_loaded: bool,
     delete_dialog: Option<DeleteDialog>,
     deleting: bool,
     deletion_report: Option<String>,
@@ -139,7 +152,18 @@ impl App {
             .or(discovery_networks.first())
             .cloned()
             .unwrap_or_default();
+        let profiles_loaded = error.is_none();
+        let vault_dialog = profiles_loaded && vault::path().is_ok_and(|path| path.is_file());
         Self {
+            vault: None,
+            vault_dialog,
+            vault_creating: false,
+            vault_password: zeroize::Zeroizing::new(String::new()),
+            vault_confirm: zeroize::Zeroizing::new(String::new()),
+            vault_error: None,
+            vault_request: None,
+            pending_server_editor: None,
+            profiles_loaded,
             discovery_settings: false,
             discovery_networks,
             discovery_range,
@@ -179,12 +203,133 @@ impl App {
             error,
         }
     }
+    fn open_vault(&mut self) {
+        if !self.profiles_loaded {
+            self.error = Some(
+                "Fix the profile loading error and restart before opening saved passwords.".into(),
+            );
+            return;
+        }
+        match vault::path().and_then(|path| path.try_exists().map_err(|e| e.to_string())) {
+            Ok(exists) => {
+                self.vault_creating = !exists;
+                self.vault_dialog = true;
+                self.vault_error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+    fn persist_credentials(&mut self) -> Result<(), String> {
+        if let Some(vault) = &mut self.vault {
+            vault.save(&self.credentials).map_err(|error| {
+                format!("Passwords remain available this session, but were not saved: {error}")
+            })?;
+            self.vault_error = None;
+        } else if self
+            .credentials
+            .values()
+            .any(|value| !value.login.is_empty() || !value.sudo.is_empty())
+        {
+            self.open_vault();
+        }
+        Ok(())
+    }
+    fn poll_vault(&mut self) {
+        let Some(receiver) = &self.vault_request else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("Password unlock worker stopped. Retry unlocking.".into())
+            }
+        };
+        self.vault_request = None;
+        match result {
+            Ok((vault, mut saved)) => {
+                saved.retain(|id, _| self.data.servers.iter().any(|server| server.id == *id));
+                saved.extend(std::mem::take(&mut self.credentials));
+                self.credentials = saved;
+                self.vault = Some(vault);
+                self.vault_dialog = false;
+                if let Err(error) = self.persist_credentials() {
+                    self.vault_error = Some(error);
+                }
+                if let Some(id) = self.pending_server_editor.take() {
+                    self.edit_server(id);
+                }
+            }
+            Err(error) => self.vault_error = Some(error),
+        }
+    }
+    fn show_vault_dialog(&mut self, ctx: &egui::Context) {
+        if !self.vault_dialog {
+            return;
+        }
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("password-vault")).show(ctx, |ui| {
+            ui.set_max_width(480.0);
+            ui.heading(if self.vault_creating { "Save passwords encrypted" } else { "Unlock saved passwords" });
+            ui.label("The master password unlocks your local server passwords for this session. It is never saved.");
+            if let Ok(path) = vault::path() { ui.label(format!("Encrypted file: {}", path.display())); }
+            if self.vault_creating { ui.label("Choose at least 12 characters. If you forget this password, the saved passwords cannot be recovered."); }
+            ui.add_enabled_ui(self.vault_request.is_none(), |ui| {
+                field(ui, "Master password", &mut self.vault_password, "", true);
+                if self.vault_creating { field(ui, "Confirm master password", &mut self.vault_confirm, "", true); }
+                ui.horizontal(|ui| {
+                    if ui.button(if self.vault_creating { "Create encrypted file" } else { "Unlock" }).clicked() { submit = true; }
+                    if ui.button("Use without saved passwords").clicked() { cancel = true; }
+                });
+            });
+            if self.vault_request.is_some() { ui.spinner(); ui.label("Unlocking passwords…"); }
+            if let Some(error) = &self.vault_error { ui.colored_label(Color32::DARK_RED, error); }
+        });
+        if cancel {
+            self.vault_password = zeroize::Zeroizing::new(String::new());
+            self.vault_confirm = zeroize::Zeroizing::new(String::new());
+            self.vault_dialog = false;
+            self.pending_server_editor = None;
+        } else if submit {
+            if self.vault_creating && self.vault_password.as_str() != self.vault_confirm.as_str() {
+                self.vault_error = Some("Master passwords do not match.".into());
+                return;
+            }
+            let path = match vault::path() {
+                Ok(path) => path,
+                Err(error) => {
+                    self.vault_error = Some(error);
+                    return;
+                }
+            };
+            let password = std::mem::replace(
+                &mut self.vault_password,
+                zeroize::Zeroizing::new(String::new()),
+            );
+            self.vault_confirm = zeroize::Zeroizing::new(String::new());
+            self.vault_error = None;
+            let create = self.vault_creating;
+            let (send, receive) = mpsc::channel();
+            self.vault_request = Some(receive);
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = send.send(vault::Vault::open(path, &password, create));
+                ctx.request_repaint();
+            });
+        }
+    }
     fn persist(&mut self) {
         if let Err(e) = store::save(&self.data) {
             self.error = Some(e);
         }
     }
     fn edit_server(&mut self, id: Option<u64>) {
+        if self.vault.is_none() && vault::path().is_ok_and(|path| path.is_file()) {
+            self.pending_server_editor = Some(id);
+            self.open_vault();
+            return;
+        }
         let server = id
             .and_then(|id| self.data.servers.iter().find(|s| s.id == id).cloned())
             .unwrap_or(Server {
@@ -201,7 +346,8 @@ impl App {
             .cloned()
             .unwrap_or(Credentials {
                 same_password: true,
-                ..Default::default()
+                login: String::new(),
+                sudo: String::new(),
             });
         self.server_editor = Some(ServerEditor {
             server,
@@ -278,7 +424,7 @@ impl App {
                 command.args(["-NoProfile", "-STA", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); Add-Type -AssemblyName System.Windows.Forms; $picker = New-Object System.Windows.Forms.FolderBrowserDialog; if ($picker.ShowDialog() -eq 'OK') { [Console]::Write($picker.SelectedPath) }; $picker.Dispose()"]);
                 command
             };
-            let result = command
+            let result = codesync::platform::background(&mut command)
                 .output()
                 .map_err(|e| format!("Folder picker unavailable ({e}). Enter the path manually."))
                 .map(|out| {
@@ -528,6 +674,9 @@ impl App {
             Selection::Server(id) => {
                 self.home_servers.remove(&id);
                 self.credentials.remove(&id);
+                if let Err(error) = self.persist_credentials() {
+                    self.vault_error = Some(error);
+                }
             }
         }
         self.status = "Removed from Codesync. Files remain in place.".into();
@@ -969,6 +1118,9 @@ impl App {
         }
     }
     fn close_focused_popup_on_escape(&mut self, ctx: &egui::Context) {
+        if self.vault_dialog {
+            return;
+        }
         let popups = [
             (self.delete_dialog.is_some(), "Delete file"),
             (self.link_editor.is_some(), "Folder / server link"),
@@ -1197,7 +1349,7 @@ impl App {
                 field(ui, "SSH / login password (blank for SSH keys)", &mut editor.credentials.login, "", true);
                 ui.checkbox(&mut editor.credentials.same_password, "Use the login password for sudo too");
                 if !editor.credentials.same_password { field(ui, "Sudo password", &mut editor.credentials.sudo, "", true); }
-                ui.label(RichText::new("Passwords stay in memory until the app closes. Sudo is used only for server setup (rsync or Tailscale).").small());
+                ui.label(RichText::new("Passwords are saved in the encrypted local vault when unlocked. Sudo is used only for server setup (rsync or Tailscale).").small());
                 if let Some(error) = &editor.error { ui.colored_label(Color32::DARK_RED, error); }
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() { save = true; }
@@ -1223,8 +1375,11 @@ impl App {
                             self.data.servers.push(editor.server);
                         }
                         self.credentials.insert(id, editor.credentials);
-                        self.persist();
-                        if tailscale {
+                        let saved =
+                            store::save(&self.data).and_then(|_| self.persist_credentials());
+                        if let Err(error) = saved {
+                            self.vault_error = Some(error);
+                        } else if tailscale {
                             self.server_action(id, Action::Tailscale, ctx);
                         } else if setup {
                             self.server_action(id, Action::Setup, ctx);
@@ -1436,6 +1591,7 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, passwor
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll_vault();
         self.poll(ctx);
         self.poll_discovery();
         if let Some(receiver) = &self.host_status_request
@@ -1457,7 +1613,8 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let busy = self.job.is_some();
-        let dialog = self.delete_dialog.is_some()
+        let dialog = self.vault_dialog
+            || self.delete_dialog.is_some()
             || self.discovery_settings
             || self.connections
             || self.folder_editor.is_some()
@@ -1467,6 +1624,29 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("Codesync");
+                if ui
+                    .add_enabled(
+                        !busy && !dialog,
+                        egui::Button::new(if self.vault.is_some() {
+                            "Lock passwords"
+                        } else {
+                            "Saved passwords…"
+                        }),
+                    )
+                    .clicked()
+                {
+                    if self.vault.is_some() {
+                        match self.persist_credentials() {
+                            Ok(()) => {
+                                self.vault = None;
+                                self.credentials.clear();
+                            }
+                            Err(error) => self.vault_error = Some(error),
+                        }
+                    } else {
+                        self.open_vault();
+                    }
+                }
                 if ui
                     .add_enabled(!busy && !dialog, egui::Button::new("Connections"))
                     .clicked()
@@ -1513,6 +1693,9 @@ impl eframe::App for App {
                 if let Some(error) = &self.error {
                     ui.colored_label(Color32::DARK_RED, error);
                 }
+                if let Some(error) = &self.vault_error {
+                    ui.colored_label(Color32::DARK_RED, error);
+                }
                 for (label, url) in &self.logins {
                     if ui
                         .button(format!("Sign in to Tailscale - {label}"))
@@ -1551,5 +1734,6 @@ impl eframe::App for App {
         });
         self.show_dialogs(ctx);
         self.show_delete_dialog(ctx);
+        self.show_vault_dialog(ctx);
     }
 }
